@@ -260,7 +260,7 @@ class OpenCodeOrchestrator:
         self,
         concurrency: int = 3,
         nga_bin: str = "nga",
-        session_timeout: int = 300,
+        session_timeout: int = 600,
     ):
         self.concurrency = concurrency
         self.nga_bin = nga_bin
@@ -547,6 +547,9 @@ class OpenCodeOrchestrator:
                 log_fh.write(f"File: {task.file_path}\n")
                 log_fh.write(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
+                # 统计信息，用于超时诊断
+                io_stats = {"last_output_time": time.time(), "total_bytes": 0, "last_label": ""}
+
                 async def _read_stream(stream, chunks: list[str], label: str, fh):
                     """实时读取 nga 输出，过滤 ANSI 后写入 log 文件"""
                     while True:
@@ -558,6 +561,9 @@ class OpenCodeOrchestrator:
                         chunks.append(text)
                         fh.write(text)
                         fh.flush()
+                        io_stats["last_output_time"] = time.time()
+                        io_stats["total_bytes"] += len(text)
+                        io_stats["last_label"] = label
 
                 # 启动后台读取任务
                 stdout_task = asyncio.create_task(
@@ -576,13 +582,22 @@ class OpenCodeOrchestrator:
                         f"[{task.task_id}] Process exited with code {task.returncode}"
                     )
                 except asyncio.TimeoutError:
-                    logger.warning(
-                        f"[{task.task_id}] Timeout after {self.session_timeout}s, killing..."
+                    elapsed = time.time() - task.start_time
+                    last_out_ago = time.time() - io_stats["last_output_time"]
+                    diag = (
+                        f"Timeout after {self.session_timeout}s | "
+                        f"Last output: {last_out_ago:.1f}s ago | "
+                        f"Total bytes: {io_stats['total_bytes']}"
                     )
+                    logger.warning(f"[{task.task_id}] {diag}")
+                    log_fh.write("\n=== Timeout ===\n")
+                    log_fh.write(f"Total runtime: {elapsed:.1f}s\n")
+                    log_fh.write(f"Last output received: {last_out_ago:.1f}s ago\n")
+                    log_fh.write(f"Total bytes collected: {io_stats['total_bytes']}\n")
                     proc.kill()
                     await proc.wait()
                     task.returncode = -1
-                    task.error = f"Timeout after {self.session_timeout}s"
+                    task.error = diag
 
                 # 等待读取任务完成（进程结束后 pipe 会 EOF，读取任务自然退出）
                 await asyncio.gather(stdout_task, stderr_task)
@@ -708,8 +723,8 @@ def main():
     parser.add_argument(
         "--timeout",
         type=int,
-        default=300,
-        help="单个 nga session 的总超时时间(秒)（默认: 300）",
+        default=600,
+        help="单个 nga session 的总超时时间(秒)（默认: 600）",
     )
 
     args = parser.parse_args()
