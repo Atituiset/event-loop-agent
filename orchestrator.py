@@ -17,27 +17,28 @@ OpenCode Agent 并行调度器 (Orchestrator)
 
 nga 交互方式:
   - 启动 nga 子进程 (stdin/stdout/stderr 均为 PIPE)
-  - Diff 模式: 发送 diff 内容 + 上下文扩展指令
+  - Diff 模式: 发送 diff 文件路径 + 上下文扩展指令，由 nga 自行读取 diff 并审查
     （提示 nga 审查函数完整实现、caller、callee、全局符号使用点）
   - 文件模式: 发送: nga run 'review <file_path>'
-  - 等待 scan_delay 秒（给 nga 时间审查）
-  - 发送: nga run '/exit' 关闭进程
+  - 动态等待 nga 处理（检测 stdout/stderr 连续空闲 5 秒后自动发送 /exit）
   - 收集 stdout 作为审查结果，stderr 作为运行日志
   - 超时自动 kill 进程
 
 输出:
-  - 终端: 实时进度日志
+  - 终端: 实时进度日志 + nga 实时输出
   - reports/YYYYMMDD_HHMMSS/<relative_path>/<file>.md: Markdown 审查报告
   - reports/YYYYMMDD_HHMMSS/<relative_path>/<file>.log: 运行日志（含 stderr）
-  - reports/YYYYMMDD_HHMMSS/<relative_path>/<file>.diff: diff 内容（Diff 模式）
+  - reports/YYYYMMDD_HHMMSS/diffs/<relative_path>/<file>.diff: diff 内容（Diff 模式）
   - reports/YYYYMMDD_HHMMSS/summary.md: 汇总报告
   - reports/YYYYMMDD_HHMMSS/orchestrator.log: 全局执行日志
 
 输出路径规则:
   - 报告和日志按文件的完整相对路径存放，保留 cared_path 前缀
+  - diff 文件单独存放在 diffs/ 子目录下，同样保留目录结构
   - 示例: cared_path=src/rr, 文件=src/rr/abc/cde/efg/Hello.c
     -> reports/20250429/src/rr/abc/cde/efg/Hello.md
     -> reports/20250429/src/rr/abc/cde/efg/Hello.log
+    -> reports/20250429/diffs/src/rr/abc/cde/efg/Hello.diff
 """
 
 import argparse
@@ -278,7 +279,8 @@ class OpenCodeOrchestrator:
         self.concurrency = concurrency
         self.nga_bin = nga_bin
         self.session_timeout = session_timeout
-        self.scan_delay = scan_delay
+        # scan_delay 语义已变更为 idle_timeout：连续无输出的空闲超时
+        self.idle_timeout = scan_delay
 
         self.tasks: list[ScanTask] = []
         self.semaphore = asyncio.Semaphore(concurrency)
@@ -290,6 +292,10 @@ class OpenCodeOrchestrator:
         self.output_dir = Path("reports") / datetime.now().strftime("%Y%m%d_%H%M%S")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Output directory: {self.output_dir}")
+
+        # diff 文件单独存放
+        self.diff_dir = self.output_dir / "diffs"
+        self.diff_dir.mkdir(parents=True, exist_ok=True)
 
         # 全局日志文件 (orchestrator.log)
         self.log_file = self.output_dir / "orchestrator.log"
@@ -402,7 +408,8 @@ class OpenCodeOrchestrator:
             diff_content = self._get_file_diff(repo, start_commit, fp)
             diff_file = ""
             if diff_content:
-                diff_path = Path(report_file).parent / f"{Path(fp).stem}.diff"
+                diff_path = self.diff_dir / Path(fp).parent / f"{Path(fp).stem}.diff"
+                diff_path.parent.mkdir(parents=True, exist_ok=True)
                 diff_path.write_text(diff_content, encoding="utf-8")
                 diff_file = str(diff_path)
                 logger.debug(f"[{i:03d}] Diff saved: {diff_path}")
@@ -483,7 +490,7 @@ class OpenCodeOrchestrator:
         logger.info(
             f"=== Starting scan: {len(self.tasks)} files, "
             f"concurrency={self.concurrency}, timeout={self.session_timeout}s, "
-            f"scan_delay={self.scan_delay}s ==="
+            f"idle_timeout={self.idle_timeout}s ==="
         )
 
         tracker = ProgressTracker(len(self.tasks))
@@ -499,13 +506,15 @@ class OpenCodeOrchestrator:
         self._save_summary(total_time)
 
     def _build_diff_scan_cmd(self, task: ScanTask) -> str:
-        """Diff 模式下构造审查命令，包含 diff 内容和上下文扩展指令"""
+        """Diff 模式下构造审查命令，指引 nga 读取 diff 文件并审查"""
         # 简单处理单引号：替换为反引号，避免破坏 nga run '...' 格式
-        diff_safe = task.diff_content.replace("'", "`")
+        diff_path_safe = task.diff_file.replace("'", "`")
+        file_path_safe = task.file_path.replace("'", "`")
 
         message = (
-            f"请审查文件 {task.file_path} 的以下代码变更：\n\n"
-            f"{diff_safe}\n\n"
+            f"请审查文件 {file_path_safe} 的代码变更。\n\n"
+            f"该文件的 diff 内容已保存到：{diff_path_safe}\n"
+            f"请读取该 diff 文件，结合变更上下文进行审查。\n\n"
             f"审查要求：\n"
             f"1. 应用无线通信安全编码规则（RULE-001~RULE-010）对变更代码进行检查\n"
             f"2. 如果变更在函数内部，请同时审查该函数的完整实现，包括："
@@ -538,6 +547,32 @@ class OpenCodeOrchestrator:
                     stderr=asyncio.subprocess.PIPE,
                 )
 
+                stdout_chunks: list[str] = []
+                stderr_chunks: list[str] = []
+                last_output_time = time.time()
+
+                async def _read_stream(stream, chunks: list[str], label: str):
+                    """实时读取 nga 输出，边读边累积边打印"""
+                    nonlocal last_output_time
+                    while True:
+                        data = await stream.read(4096)
+                        if not data:
+                            break
+                        text = data.decode("utf-8", errors="replace")
+                        chunks.append(text)
+                        # 实时打印到终端，让用户看到 nga 在说话
+                        for line in text.rstrip("\n").split("\n"):
+                            print(f"[{task.task_id} {label}] {line}")
+                        last_output_time = time.time()
+
+                # 启动后台读取任务
+                stdout_task = asyncio.create_task(
+                    _read_stream(proc.stdout, stdout_chunks, "OUT")
+                )
+                stderr_task = asyncio.create_task(
+                    _read_stream(proc.stderr, stderr_chunks, "ERR")
+                )
+
                 # 2. 构造并发送扫描命令
                 if task.diff_content:
                     # Diff 模式: 发送 diff 内容 + 上下文扩展指令
@@ -551,36 +586,71 @@ class OpenCodeOrchestrator:
                 proc.stdin.write(scan_cmd.encode("utf-8") + b"\n")
                 await proc.stdin.drain()
 
-                # 3. 等待 nga 审查
-                logger.debug(f"[{task.task_id}] Waiting {self.scan_delay}s for scan...")
-                await asyncio.sleep(self.scan_delay)
+                # 3. 动态等待 nga 处理完毕（空闲检测）
+                idle_timeout = self.idle_timeout
+                wait_start = time.time()
+                wait_task = asyncio.create_task(proc.wait())
 
-                # 4. 发送退出命令
-                exit_cmd = "nga run '/exit'"
-                logger.debug(f"[{task.task_id}] Send: {exit_cmd}")
-                proc.stdin.write(exit_cmd.encode("utf-8") + b"\n")
-                await proc.stdin.drain()
+                logger.debug(
+                    f"[{task.task_id}] Waiting for nga to finish "
+                    f"(idle_timeout={idle_timeout}s, max={self.session_timeout}s)..."
+                )
+
+                while True:
+                    await asyncio.sleep(0.5)
+
+                    # 硬超时检查
+                    if time.time() - wait_start > self.session_timeout:
+                        raise asyncio.TimeoutError
+
+                    # 进程自然结束
+                    if wait_task.done():
+                        break
+
+                    # 空闲检测：连续 idle_timeout 秒无新输出
+                    if time.time() - last_output_time > idle_timeout:
+                        logger.debug(
+                            f"[{task.task_id}] Idle for {idle_timeout}s, preparing to exit"
+                        )
+                        break
+
+                # 4. 发送退出命令（如果进程还在运行）
+                if not wait_task.done():
+                    exit_cmd = "nga run '/exit'"
+                    logger.debug(f"[{task.task_id}] Send: {exit_cmd}")
+                    proc.stdin.write(exit_cmd.encode("utf-8") + b"\n")
+                    await proc.stdin.drain()
 
                 proc.stdin.close()
                 await proc.stdin.wait_closed()
 
-                # 5. 等待进程结束，带超时
-                try:
-                    stdout, stderr = await asyncio.wait_for(
-                        proc.communicate(), timeout=self.session_timeout
+                # 5. 等待进程结束（如果还没结束的话）
+                if not wait_task.done():
+                    try:
+                        task.returncode = await asyncio.wait_for(proc.wait(), timeout=30)
+                        logger.debug(
+                            f"[{task.task_id}] Process exited with code {task.returncode}"
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"[{task.task_id}] Timeout waiting for exit, killing..."
+                        )
+                        proc.kill()
+                        await proc.wait()
+                        task.returncode = -1
+                        task.error = "Timeout waiting for exit after /exit"
+                else:
+                    task.returncode = wait_task.result()
+                    logger.debug(
+                        f"[{task.task_id}] Process exited naturally with code {task.returncode}"
                     )
-                    task.returncode = proc.returncode
-                    logger.debug(f"[{task.task_id}] Process exited with code {proc.returncode}")
-                except asyncio.TimeoutError:
-                    logger.warning(f"[{task.task_id}] Timeout after {self.session_timeout}s, killing...")
-                    proc.kill()
-                    stdout, stderr = await proc.communicate()
-                    task.returncode = -1
-                    task.error = f"Timeout after {self.session_timeout}s"
+
+                # 等待读取任务完成（进程结束后 pipe 会 EOF，读取任务自然退出）
+                await asyncio.gather(stdout_task, stderr_task)
 
                 task.end_time = time.time()
-                task.stdout = stdout.decode("utf-8", errors="replace")
-                task.stderr = stderr.decode("utf-8", errors="replace")
+                task.stdout = "".join(stdout_chunks)
+                task.stderr = "".join(stderr_chunks)
 
                 # 6. 判断结果
                 if task.returncode == 0 and not task.error:
@@ -644,7 +714,7 @@ def main():
   # 递归扫描目录
   python orchestrator.py --files app/a app/b -c 3
 
-  # 调整扫描等待时间和超时
+  # 调整空闲检测超时（连续无输出多少秒后发送 /exit）和会话总超时
   python orchestrator.py --diff abc123 --scan-delay 20 --timeout 600
         """,
     )
@@ -687,7 +757,7 @@ def main():
         "--scan-delay",
         type=int,
         default=10,
-        help="发送扫描命令后等待的秒数，给 nga 时间审查（默认: 10）",
+        help="空闲检测超时(秒)：nga 连续无输出多久后自动发送 /exit（默认: 10）",
     )
     parser.add_argument(
         "--timeout",
