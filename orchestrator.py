@@ -16,18 +16,26 @@ OpenCode Agent 并行调度器 (Orchestrator)
      python orchestrator.py --diff abc123 --paths app/a,app/b --repo .
 
 nga 交互方式:
-  - 启动 nga 子进程 (stdin/stdout/stderr 均为 PIPE)
-  - Diff 模式: 发送 diff 文件路径 + 上下文扩展指令，由 nga 自行读取 diff 并审查
-    （提示 nga 审查函数完整实现、caller、callee、全局符号使用点）
-  - 文件模式: 发送: nga run 'review <file_path>'
-  - 动态等待 nga 处理（检测 stdout/stderr 连续空闲 5 秒后自动发送 /exit）
-  - 收集 stdout 作为审查结果，stderr 作为运行日志
-  - 超时自动 kill 进程
+  - 启动 nga 子进程: nga run '<message>'（命令行参数方式）
+  - Diff 模式: message 为审查提示词，指引 nga 读取 diffs/ 下的 diff 文件
+  - 文件模式: message 为 'review <file_path>'
+  - 实时收集 stdout/stderr 到各自 .log 文件，过滤 ANSI 转义序列
+
+超时策略（动态超时 + 软/硬两阶段）:
+  - 超时按 diff 行数动态计算: 基础 300s + (diff_lines // 10) * 60s，封顶 900s (15min)
+    | diff 行数 | 软超时 | 硬超时 |
+    |-----------|--------|--------|
+    | 0         | ~270s  | 300s   |
+    | 50        | ~540s  | 600s   |
+    | >=100     | ~870s  | 900s   |
+  - 软超时: 先发送 SIGTERM，给 nga 机会 flush 已分析的部分结果
+  - 硬超时: SIGTERM 后 30s 仍未退出，发送 SIGKILL 强制终止
+  - 超时 kill 后，已收集到的部分 stdout 仍会保存到 .md 报告
 
 输出:
-  - 终端: 实时进度日志 + nga 实时输出
+  - 终端: START/DONE/进度摘要（每个 task 带文件路径前缀，方便追踪）
   - reports/YYYYMMDD_HHMMSS/<relative_path>/<file>.md: Markdown 审查报告
-  - reports/YYYYMMDD_HHMMSS/<relative_path>/<file>.log: 运行日志（含 stderr）
+  - reports/YYYYMMDD_HHMMSS/<relative_path>/<file>.log: 运行日志（含 nga stdout/stderr）
   - reports/YYYYMMDD_HHMMSS/diffs/<relative_path>/<file>.diff: diff 内容（Diff 模式）
   - reports/YYYYMMDD_HHMMSS/summary.md: 汇总报告
   - reports/YYYYMMDD_HHMMSS/orchestrator.log: 全局执行日志
