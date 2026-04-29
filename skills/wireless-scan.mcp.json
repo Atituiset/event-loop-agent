@@ -28,7 +28,7 @@
           "description": "启用的扫描规则",
           "items": {
             "type": "string",
-            "enum": ["RULE-001", "RULE-002", "RULE-003", "RULE-004"]
+            "enum": ["RULE-001", "RULE-002", "RULE-003", "RULE-004", "RULE-005", "RULE-006", "RULE-007", "RULE-008", "RULE-009", "RULE-010"]
           }
         }
       },
@@ -86,6 +86,72 @@
           "访问 ext_ 等 OPTIONAL 成员前是否检查 Presence 标志位",
           "指针是否为 NULL 的判断",
           "CHOICE/ENUM 的 switch 是否包含处理未来版本新增的 default"
+        ]
+      },
+      {
+        "id": "RULE-005",
+        "name": "相似变量名混淆",
+        "severity": "MEDIUM",
+        "description": "检查同一作用域内名字高度相似的变量是否存在误用",
+        "check_points": [
+          "同一函数内是否存在仅差几个字符的变量名（如 buf/buff，len/length，data/data_ptr）",
+          "是否存在赋值给变量 A 但后续逻辑使用的是变量 B",
+          "指针和非指针版本是否混用"
+        ]
+      },
+      {
+        "id": "RULE-006",
+        "name": "重复/冗余代码",
+        "severity": "LOW",
+        "description": "检查复制粘贴后未修改、或相同功能的重复代码块",
+        "check_points": [
+          "连续相同的代码块（复制粘贴后忘记修改变量名或逻辑）",
+          "相邻几行功能完全相同（重复赋值、重复判断）",
+          "多个分支内包含完全相同的代码段（应提取为公共函数）"
+        ]
+      },
+      {
+        "id": "RULE-007",
+        "name": "未初始化变量使用",
+        "severity": "HIGH",
+        "description": "检查局部变量、结构体是否在使用前被初始化",
+        "check_points": [
+          "基本类型局部变量声明后未赋值就参与运算或作为条件",
+          "结构体局部变量声明后未 memset 或逐字段初始化就使用",
+          "数组声明后未初始化就读取"
+        ]
+      },
+      {
+        "id": "RULE-008",
+        "name": "内存泄漏",
+        "severity": "HIGH",
+        "description": "检查动态分配的内存是否在所有路径都被释放",
+        "check_points": [
+          "malloc/calloc/strdup 后是否有对应的 free",
+          "异常返回路径（如错误处理分支）是否遗漏了 free",
+          "循环内分配内存是否每次迭代都释放"
+        ]
+      },
+      {
+        "id": "RULE-009",
+        "name": "空指针解引用",
+        "severity": "CRITICAL",
+        "description": "检查指针在使用前是否被验证非空",
+        "check_points": [
+          "函数返回值（如 malloc、find_node、get_config）未检查是否为 NULL 就解引用",
+          "指针参数未检查就使用",
+          "链表/树遍历中下一个节点未检查就访问"
+        ]
+      },
+      {
+        "id": "RULE-010",
+        "name": "数组越界",
+        "severity": "CRITICAL",
+        "description": "检查数组访问是否超出声明的边界",
+        "check_points": [
+          "数组索引是否为变量且未校验范围",
+          "for/while 循环条件是否导致越界（如 <= 误用）",
+          "字符串操作（如 strcpy、sprintf）是否可能溢出目标缓冲区"
         ]
       }
     ],
