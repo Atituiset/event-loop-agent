@@ -44,6 +44,8 @@ nga 交互方式:
 import argparse
 import asyncio
 import logging
+import os
+import re
 import signal
 import subprocess
 import sys
@@ -52,6 +54,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+# ANSI 转义序列过滤（用于清理 nga 终端控制输出，作为 TERM=dumb 的兜底）
+ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 # ============================================================================
 # 日志配置: 终端显示进度
@@ -521,13 +526,16 @@ class OpenCodeOrchestrator:
 
                 logger.debug(f"[{task.task_id}] Command: nga run '{message[:200]}...'")
 
-                # 2. 启动 nga 子进程（命令行参数方式）
+                # 2. 启动 nga 子进程（命令行参数方式，TERM=dumb 避免 ANSI 乱码）
+                env = os.environ.copy()
+                env["TERM"] = "dumb"
                 proc = await asyncio.create_subprocess_exec(
                     self.nga_bin,
                     "run",
                     message,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    env=env,
                 )
 
                 stdout_chunks: list[str] = []
@@ -540,12 +548,13 @@ class OpenCodeOrchestrator:
                 log_fh.write(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
                 async def _read_stream(stream, chunks: list[str], label: str, fh):
-                    """实时读取 nga 输出，边读边累积边写入 log 文件"""
+                    """实时读取 nga 输出，过滤 ANSI 后写入 log 文件"""
                     while True:
                         data = await stream.read(4096)
                         if not data:
                             break
                         text = data.decode("utf-8", errors="replace")
+                        text = ANSI_ESCAPE.sub("", text)
                         chunks.append(text)
                         fh.write(text)
                         fh.flush()
