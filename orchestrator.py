@@ -9,21 +9,31 @@ OpenCode Agent 并行调度器 (Orchestrator)
   1. Diff 模式: 自动提取从指定 commit 到 HEAD 的变更文件
      python orchestrator.py --diff abc123 --repo ./app
 
-  2. 文件列表模式: 手动指定要扫描的文件
-     python orchestrator.py --files file1.c file2.c file3.c
+  2. 文件列表模式: 手动指定要扫描的文件或目录
+     python orchestrator.py --files file1.c file2.c dir1/ dir2/ -c 3
+
+  3. 指定关注目录（两种模式都支持）:
+     python orchestrator.py --diff abc123 --paths app/a,app/b --repo .
 
 nga 交互方式:
   - 启动 nga 子进程 (stdin/stdout/stderr 均为 PIPE)
   - 发送: nga run 'review <file_path>'
   - 等待 scan_delay 秒（给 nga 时间审查）
   - 发送: nga run '/exit' 关闭进程
-  - 收集 stdout/stderr，生成 Markdown 审查报告
+  - 收集 stdout 作为审查结果，stderr 作为运行日志
   - 超时自动 kill 进程
 
 输出:
   - 终端: 实时进度日志
-  - reports/YYYYMMDD_HHMMSS/*.md: 每个文件的 Markdown 审查报告
+  - reports/YYYYMMDD_HHMMSS/<relative_path>/<file>.md: Markdown 审查报告
+  - reports/YYYYMMDD_HHMMSS/<relative_path>/<file>.log: 运行日志（含 stderr）
   - reports/YYYYMMDD_HHMMSS/summary.md: 汇总报告
+
+输出路径规则:
+  - 报告和日志按文件相对于 cared_path（或当前工作目录）的目录结构存放
+  - 示例: cared_path=src/rr, 文件=src/rr/abc/cde/efg/Hello.c
+    -> reports/20250429/abc/cde/efg/Hello.md
+    -> reports/20250429/abc/cde/efg/Hello.log
 """
 
 import argparse
@@ -40,7 +50,7 @@ from pathlib import Path
 from typing import Optional
 
 # ============================================================================
-# 日志配置: 终端显示进度，日志文件保存详细运行日志
+# 日志配置: 终端显示进度
 # ============================================================================
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
@@ -56,21 +66,6 @@ console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
 logger.addHandler(console_handler)
 
-# 文件 handler (DEBUG 级别，详细日志) — 延迟到知道输出目录后再添加
-_file_handler: Optional[logging.FileHandler] = None
-
-
-def setup_file_logger(log_dir: Path):
-    """设置文件日志 handler"""
-    global _file_handler
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "orchestrator.log"
-    _file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    _file_handler.setLevel(logging.DEBUG)
-    _file_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
-    logger.addHandler(_file_handler)
-    logger.info(f"Log file: {log_file}")
-
 
 # ============================================================================
 # 数据模型
@@ -81,13 +76,14 @@ class ScanTask:
     """单个文件的扫描任务"""
     file_path: str
     task_id: str
-    status: str = "pending"          # pending, running, done, failed
+    report_file: str        # Markdown 报告路径
+    log_file: str           # 运行日志路径
+    status: str = "pending"  # pending, running, done, failed
     start_time: Optional[float] = None
     end_time: Optional[float] = None
-    report_file: str = ""            # Markdown 报告路径
-    stdout: str = ""                 # nga stdout
-    stderr: str = ""                 # nga stderr
-    error: str = ""                  # 错误信息
+    stdout: str = ""         # nga stdout (审查结果)
+    stderr: str = ""         # nga stderr
+    error: str = ""          # 错误信息
     returncode: Optional[int] = None
 
     @property
@@ -111,7 +107,6 @@ class ProgressTracker:
         self.failed = 0
         self.start_time = time.time()
         self._printed = False
-        # 保存 logger 的原始级别，用于恢复
         self._original_console_level = console_handler.level
 
     def _quiet_logger(self):
@@ -138,7 +133,7 @@ class ProgressTracker:
         """结束进度显示，打印最终统计"""
         self._restore_logger()
         if self._printed:
-            print()  # 换行，清理进度行
+            print()
         elapsed = time.time() - self.start_time
         logger.info(
             f"Finished: {self.completed}/{self.total} files | "
@@ -163,55 +158,53 @@ class ProgressTracker:
 # ============================================================================
 
 def generate_report(task: ScanTask) -> str:
-    """为单个任务生成 Markdown 审查报告"""
+    """生成 Markdown 审查报告 — 只展示审查结果（nga stdout）"""
     lines = []
     lines.append(f"# 代码审查报告 - {Path(task.file_path).name}")
     lines.append("")
-    lines.append("## 扫描信息")
+    lines.append(f"**文件**: `{task.file_path}`")
+    lines.append(f"**任务ID**: `{task.task_id}`")
+    lines.append(f"**扫描时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"**耗时**: {task.duration}s")
+    lines.append(f"**状态**: {'完成' if task.status == 'done' else '失败'}")
     lines.append("")
-    lines.append("| 项目 | 值 |")
-    lines.append("|------|-----|")
-    lines.append(f"| 文件路径 | `{task.file_path}` |")
-    lines.append(f"| 任务ID | `{task.task_id}` |")
-    lines.append(f"| 扫描时间 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} |")
-    lines.append(f"| 耗时 | {task.duration}s |")
-    lines.append(f"| 状态 | {'完成' if task.status == 'done' else '失败'} |")
-    lines.append(f"| 退出码 | {task.returncode} |")
+    lines.append("---")
+    lines.append("")
+
+    if task.stdout.strip():
+        # 直接展示 nga 的审查结果，不加代码块包装
+        lines.append(task.stdout)
+    else:
+        lines.append("*无审查结果*")
+
+    lines.append("")
+    lines.append("---")
+    lines.append(f"*Generated by OpenCode Orchestrator*")
+
+    return "\n".join(lines)
+
+
+def generate_log(task: ScanTask) -> str:
+    """生成运行日志 — 保存运行详情和 stderr"""
+    lines = []
+    lines.append(f"=== Task: {task.task_id} ===")
+    lines.append(f"File: {task.file_path}")
+    lines.append(f"Status: {task.status}")
+    lines.append(f"Duration: {task.duration}s")
+    lines.append(f"Return code: {task.returncode}")
+    lines.append(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("")
 
     if task.error:
-        lines.append("## 错误信息")
-        lines.append("")
-        lines.append(f"```")
+        lines.append("=== Error ===")
         lines.append(task.error)
-        lines.append(f"```")
         lines.append("")
 
-    # STDOUT
-    if task.stdout.strip():
-        lines.append("## STDOUT (审查输出)")
-        lines.append("")
-        lines.append("```")
-        lines.append(task.stdout)
-        lines.append("```")
-        lines.append("")
-    else:
-        lines.append("## STDOUT (审查输出)")
-        lines.append("")
-        lines.append("*无输出*")
-        lines.append("")
-
-    # STDERR
+    lines.append("=== STDERR ===")
     if task.stderr.strip():
-        lines.append("## STDERR")
-        lines.append("")
-        lines.append("```")
         lines.append(task.stderr)
-        lines.append("```")
-        lines.append("")
-
-    lines.append("---")
-    lines.append(f"*Generated by OpenCode Orchestrator at {datetime.now().isoformat()}*")
+    else:
+        lines.append("*No stderr output*")
 
     return "\n".join(lines)
 
@@ -237,19 +230,22 @@ def generate_summary(tasks: list[ScanTask], total_time: float) -> str:
 
     lines.append("## 详细结果")
     lines.append("")
-    lines.append("| # | 文件 | 状态 | 耗时 | 报告 |")
-    lines.append("|---|------|------|------|------|")
+    lines.append("| # | 文件 | 状态 | 耗时 | 报告 | 日志 |")
+    lines.append("|---|------|------|------|------|------|")
 
     for i, t in enumerate(tasks, 1):
         status_icon = "✅" if t.status == "done" else "❌"
-        report_link = f"[{Path(t.report_file).name}]({Path(t.report_file).name})"
+        report_name = Path(t.report_file).name
+        log_name = Path(t.log_file).name
+        report_link = f"[{report_name}]({Path(t.report_file).relative_to(Path(t.report_file).parents[-3])})"
+        log_link = f"[{log_name}]({Path(t.log_file).relative_to(Path(t.log_file).parents[-3])})"
         lines.append(
-            f"| {i} | `{t.file_path}` | {status_icon} {t.status} | {t.duration}s | {report_link} |"
+            f"| {i} | `{t.file_path}` | {status_icon} {t.status} | {t.duration}s | {report_link} | {log_link} |"
         )
 
     lines.append("")
     lines.append("---")
-    lines.append(f"*Generated by OpenCode Orchestrator*")
+    lines.append("*Generated by OpenCode Orchestrator*")
 
     return "\n".join(lines)
 
@@ -285,10 +281,48 @@ class OpenCodeOrchestrator:
         # 输出目录
         self.output_dir = Path("reports") / datetime.now().strftime("%Y%m%d_%H%M%S")
         self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        # 设置文件日志
-        setup_file_logger(self.output_dir)
         logger.info(f"Output directory: {self.output_dir}")
+
+    # ------------------------------------------------------------------
+    #  路径计算
+    # ------------------------------------------------------------------
+
+    def _get_output_paths(self, file_path: str, cared_paths: Optional[list[str]]) -> tuple[Path, Path]:
+        """
+        计算报告和日志的输出路径。
+
+        规则：
+        1. 如果指定了 cared_paths，使用文件相对于第一个匹配的 cared_path 的路径
+        2. 如果没有 cared_paths，使用文件相对于当前工作目录的路径
+
+        示例:
+          cared_path=src/rr, file=src/rr/abc/cde/efg/Hello.c
+          -> sub_dir=abc/cde/efg, stem=Hello
+          -> reports/20250429/abc/cde/efg/Hello.md
+        """
+        rel_path = file_path
+
+        if cared_paths:
+            for cp in cared_paths:
+                cp = cp.rstrip("/")
+                if file_path.startswith(cp + "/"):
+                    rel_path = file_path[len(cp) + 1:]  # 去掉 cp/ 前缀
+                    break
+                elif file_path == cp:
+                    rel_path = Path(file_path).name
+                    break
+
+        path_obj = Path(rel_path)
+        sub_dir = path_obj.parent
+        file_stem = path_obj.stem
+
+        base_dir = self.output_dir / sub_dir
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        report_file = base_dir / f"{file_stem}.md"
+        log_file = base_dir / f"{file_stem}.log"
+
+        return report_file, log_file
 
     # ------------------------------------------------------------------
     #  任务初始化
@@ -308,11 +342,9 @@ class OpenCodeOrchestrator:
         for fp in file_paths:
             path = Path(fp)
             if path.is_file():
-                # 统一转换为相对路径
                 rel_path = path.relative_to(cwd) if path.is_absolute() else path
                 all_files.append(str(rel_path))
             elif path.is_dir():
-                # 递归扫描目录下的 C/C++ 文件，统一用相对路径
                 for ext in c_extensions:
                     for p in path.rglob(f"*{ext}"):
                         rel_path = p.relative_to(cwd) if p.is_absolute() else p
@@ -320,24 +352,20 @@ class OpenCodeOrchestrator:
             else:
                 logger.warning(f"Path not found: {fp}")
 
-        # 去重并排序
         all_files = sorted(set(all_files))
 
         for i, fp in enumerate(all_files, 1):
+            report_file, log_file = self._get_output_paths(fp, cared_paths)
             self.tasks.append(ScanTask(
                 file_path=fp,
                 task_id=f"task-{i:03d}",
-                report_file=str(self.output_dir / f"report_{i:03d}_{Path(fp).name}.md"),
+                report_file=str(report_file),
+                log_file=str(log_file),
             ))
         logger.info(f"File mode: {len(self.tasks)} files")
 
     def setup_diff_mode(self, start_commit: str, repo_path: str = ".", cared_paths: Optional[list[str]] = None):
-        """Diff 模式: 提取变更文件
-
-        - 执行 git diff 获取从 start_commit 到 HEAD 的变更文件
-        - 过滤 C/C++ 文件
-        - 如果指定了 cared_paths，只保留在 cared_paths 中的文件
-        """
+        """Diff 模式: 提取变更文件"""
         repo = Path(repo_path).resolve()
         logger.info(f"Diff mode: repo={repo}, start_commit={start_commit}")
 
@@ -357,29 +385,13 @@ class OpenCodeOrchestrator:
             logger.info(f"After cared_paths filter: {len(changed_files)} files")
 
         for i, fp in enumerate(changed_files, 1):
+            report_file, log_file = self._get_output_paths(fp, cared_paths)
             self.tasks.append(ScanTask(
                 file_path=fp,
                 task_id=f"task-{i:03d}",
-                report_file=str(self.output_dir / f"report_{i:03d}_{Path(fp).name}.md"),
+                report_file=str(report_file),
+                log_file=str(log_file),
             ))
-
-    @staticmethod
-    def _filter_by_cared_paths(file_paths: list[str], cared_paths: list[str]) -> list[str]:
-        """过滤出路径前缀匹配 cared_paths 的文件
-
-        使用精确匹配：文件路径必须等于 cared_path，或在 cared_path 的子目录下。
-        避免误判（如 app/a_test.c 不会被匹配到 app/a）。
-        """
-        # 标准化 cared_paths（去掉尾部斜杠）
-        normalized_cared = [cp.rstrip("/") for cp in cared_paths]
-        filtered = []
-        for fp in file_paths:
-            for cp in normalized_cared:
-                # 精确匹配：文件路径等于 cared_path，或以 cared_path/ 开头
-                if fp == cp or fp.startswith(cp + "/"):
-                    filtered.append(fp)
-                    break
-        return filtered
 
     def _get_changed_files(self, repo: Path, start_commit: str) -> list[str]:
         """执行 git diff 获取变更文件列表"""
@@ -400,6 +412,18 @@ class OpenCodeOrchestrator:
         except Exception as e:
             logger.error(f"Failed to get changed files: {e}")
             return []
+
+    @staticmethod
+    def _filter_by_cared_paths(file_paths: list[str], cared_paths: list[str]) -> list[str]:
+        """过滤出路径前缀匹配 cared_paths 的文件（精确匹配，避免误判）"""
+        normalized_cared = [cp.rstrip("/") for cp in cared_paths]
+        filtered = []
+        for fp in file_paths:
+            for cp in normalized_cared:
+                if fp == cp or fp.startswith(cp + "/"):
+                    filtered.append(fp)
+                    break
+        return filtered
 
     # ------------------------------------------------------------------
     #  主控循环
@@ -451,8 +475,7 @@ class OpenCodeOrchestrator:
                     stderr=asyncio.subprocess.PIPE,
                 )
 
-                # 2. 发送扫描命令: nga run 'review <file>'
-                #    用 shlex.quote 处理文件路径中的特殊字符
+                # 2. 发送扫描命令
                 quoted_file = shlex.quote(task.file_path)
                 scan_cmd = f"nga run 'review {quoted_file}'"
 
@@ -460,17 +483,16 @@ class OpenCodeOrchestrator:
                 proc.stdin.write(scan_cmd.encode("utf-8") + b"\n")
                 await proc.stdin.drain()
 
-                # 3. 等待 nga 审查（给 nga 时间处理）
+                # 3. 等待 nga 审查
                 logger.debug(f"[{task.task_id}] Waiting {self.scan_delay}s for scan...")
                 await asyncio.sleep(self.scan_delay)
 
-                # 4. 发送退出命令: nga run '/exit'
+                # 4. 发送退出命令
                 exit_cmd = "nga run '/exit'"
                 logger.debug(f"[{task.task_id}] Send: {exit_cmd}")
                 proc.stdin.write(exit_cmd.encode("utf-8") + b"\n")
                 await proc.stdin.drain()
 
-                # 关闭 stdin，告诉 nga 没有更多输入了
                 proc.stdin.close()
                 await proc.stdin.wait_closed()
 
@@ -506,10 +528,14 @@ class OpenCodeOrchestrator:
                         f"[{task.task_id}] FAILED (code={task.returncode}) | {task.file_path} | {task.error}"
                     )
 
-                # 7. 生成 Markdown 报告
+                # 7. 生成 Markdown 报告（只含审查结果）和日志文件（含 stderr）
                 report_md = generate_report(task)
                 Path(task.report_file).write_text(report_md, encoding="utf-8")
                 logger.debug(f"[{task.task_id}] Report saved: {task.report_file}")
+
+                log_content = generate_log(task)
+                Path(task.log_file).write_text(log_content, encoding="utf-8")
+                logger.debug(f"[{task.task_id}] Log saved: {task.log_file}")
 
                 tracker.complete_task(success=(task.status == "done"))
 
@@ -561,7 +587,7 @@ def main():
         "--files",
         nargs="+",
         default=[],
-        help="要扫描的文件路径列表",
+        help="要扫描的文件或目录列表（目录会自动递归扫描 C/C++ 文件）",
     )
     group.add_argument(
         "--diff",
@@ -571,7 +597,7 @@ def main():
 
     parser.add_argument(
         "--paths",
-        help="关注的相对目录，逗号分隔（如 app/a,app/b）。Diff 模式下只保留这些目录下的变更文件；文件列表模式下递归扫描这些目录",
+        help="关注的相对目录，逗号分隔（如 app/a,app/b）。Diff 模式下只保留这些目录下的变更文件",
     )
     parser.add_argument(
         "--repo",
