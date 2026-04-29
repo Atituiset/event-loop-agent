@@ -44,7 +44,6 @@ nga 交互方式:
 import argparse
 import asyncio
 import logging
-import shlex
 import signal
 import subprocess
 import sys
@@ -103,8 +102,8 @@ class ScanTask:
 class ProgressTracker:
     """终端进度跟踪器
 
-    在进度显示期间，临时将 logger 的终端输出级别提升到 WARNING，
-    避免 INFO 日志打断进度行。
+    进度信息通过 logger.info 输出，不再使用 \r 刷新进度行，
+    避免与 nga 实时输出冲突。
     """
 
     def __init__(self, total: int):
@@ -113,34 +112,19 @@ class ProgressTracker:
         self.running = 0
         self.failed = 0
         self.start_time = time.time()
-        self._printed = False
-        self._original_console_level = console_handler.level
-
-    def _quiet_logger(self):
-        """降低终端日志级别，避免打断进度显示"""
-        console_handler.setLevel(logging.WARNING)
-
-    def _restore_logger(self):
-        """恢复终端日志级别"""
-        console_handler.setLevel(self._original_console_level)
 
     def start_task(self):
-        self._quiet_logger()
         self.running += 1
-        self._print()
 
     def complete_task(self, success: bool = True):
         self.running -= 1
         self.completed += 1
         if not success:
             self.failed += 1
-        self._print()
+        self._print_progress()
 
     def finish(self):
         """结束进度显示，打印最终统计"""
-        self._restore_logger()
-        if self._printed:
-            print()
         elapsed = time.time() - self.start_time
         logger.info(
             f"Finished: {self.completed}/{self.total} files | "
@@ -148,16 +132,14 @@ class ProgressTracker:
             f"Total time: {elapsed:.1f}s"
         )
 
-    def _print(self):
+    def _print_progress(self):
         elapsed = time.time() - self.start_time
         pct = self.completed / self.total * 100 if self.total > 0 else 0
-        line = (
-            f"\rProgress: {self.completed}/{self.total} ({pct:.0f}%) | "
+        logger.info(
+            f"Progress: {self.completed}/{self.total} ({pct:.0f}%) | "
             f"Running: {self.running} | Failed: {self.failed} | "
             f"Elapsed: {elapsed:.0f}s"
         )
-        print(line, end="", flush=True)
-        self._printed = True
 
 
 # ============================================================================
@@ -274,13 +256,10 @@ class OpenCodeOrchestrator:
         concurrency: int = 3,
         nga_bin: str = "nga",
         session_timeout: int = 300,
-        scan_delay: int = 10,
     ):
         self.concurrency = concurrency
         self.nga_bin = nga_bin
         self.session_timeout = session_timeout
-        # scan_delay 语义已变更为 idle_timeout：连续无输出的空闲超时
-        self.idle_timeout = scan_delay
 
         self.tasks: list[ScanTask] = []
         self.semaphore = asyncio.Semaphore(concurrency)
@@ -489,8 +468,7 @@ class OpenCodeOrchestrator:
 
         logger.info(
             f"=== Starting scan: {len(self.tasks)} files, "
-            f"concurrency={self.concurrency}, timeout={self.session_timeout}s, "
-            f"idle_timeout={self.idle_timeout}s ==="
+            f"concurrency={self.concurrency}, timeout={self.session_timeout}s ==="
         )
 
         tracker = ProgressTracker(len(self.tasks))
@@ -506,14 +484,10 @@ class OpenCodeOrchestrator:
         self._save_summary(total_time)
 
     def _build_diff_scan_cmd(self, task: ScanTask) -> str:
-        """Diff 模式下构造审查命令，指引 nga 读取 diff 文件并审查"""
-        # 简单处理单引号：替换为反引号，避免破坏 nga run '...' 格式
-        diff_path_safe = task.diff_file.replace("'", "`")
-        file_path_safe = task.file_path.replace("'", "`")
-
+        """Diff 模式下构造审查提示词，指引 nga 读取 diff 文件并审查"""
         message = (
-            f"请审查文件 {file_path_safe} 的代码变更。\n\n"
-            f"该文件的 diff 内容已保存到：{diff_path_safe}\n"
+            f"请审查文件 {task.file_path} 的代码变更。\n\n"
+            f"该文件的 diff 内容已保存到：{task.diff_file}\n"
             f"请读取该 diff 文件，结合变更上下文进行审查。\n\n"
             f"审查要求：\n"
             f"1. 应用无线通信安全编码规则（RULE-001~RULE-010）对变更代码进行检查\n"
@@ -523,7 +497,7 @@ class OpenCodeOrchestrator:
             f"请找到该符号的所有使用点并一并审查\n"
             f"4. 对每个发现的问题提供：文件路径、行号、问题描述、代码片段、修复建议、置信度"
         )
-        return f"nga run '{message}'"
+        return message
 
     async def _scan_one(self, task: ScanTask, tracker: ProgressTracker):
         """扫描单个文件"""
@@ -539,111 +513,67 @@ class OpenCodeOrchestrator:
             logger.info(f"[{task.task_id}] START {task.file_path}")
 
             try:
-                # 1. 启动 nga 子进程
+                # 1. 构造命令参数
+                if task.diff_content:
+                    message = self._build_diff_scan_cmd(task)
+                else:
+                    message = f"review {task.file_path}"
+
+                logger.debug(f"[{task.task_id}] Command: nga run '{message[:200]}...'")
+
+                # 2. 启动 nga 子进程（命令行参数方式）
                 proc = await asyncio.create_subprocess_exec(
                     self.nga_bin,
-                    stdin=asyncio.subprocess.PIPE,
+                    "run",
+                    message,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
 
                 stdout_chunks: list[str] = []
                 stderr_chunks: list[str] = []
-                last_output_time = time.time()
 
-                async def _read_stream(stream, chunks: list[str], label: str):
-                    """实时读取 nga 输出，边读边累积边打印"""
-                    nonlocal last_output_time
+                # 打开 .log 文件，准备实时写入
+                log_fh = Path(task.log_file).open("w", encoding="utf-8")
+                log_fh.write(f"=== Task: {task.task_id} ===\n")
+                log_fh.write(f"File: {task.file_path}\n")
+                log_fh.write(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+                async def _read_stream(stream, chunks: list[str], label: str, fh):
+                    """实时读取 nga 输出，边读边累积边写入 log 文件"""
                     while True:
                         data = await stream.read(4096)
                         if not data:
                             break
                         text = data.decode("utf-8", errors="replace")
                         chunks.append(text)
-                        # 实时打印到终端，让用户看到 nga 在说话
-                        for line in text.rstrip("\n").split("\n"):
-                            print(f"[{task.task_id} {label}] {line}")
-                        last_output_time = time.time()
+                        fh.write(text)
+                        fh.flush()
 
                 # 启动后台读取任务
                 stdout_task = asyncio.create_task(
-                    _read_stream(proc.stdout, stdout_chunks, "OUT")
+                    _read_stream(proc.stdout, stdout_chunks, "OUT", log_fh)
                 )
                 stderr_task = asyncio.create_task(
-                    _read_stream(proc.stderr, stderr_chunks, "ERR")
+                    _read_stream(proc.stderr, stderr_chunks, "ERR", log_fh)
                 )
 
-                # 2. 构造并发送扫描命令
-                if task.diff_content:
-                    # Diff 模式: 发送 diff 内容 + 上下文扩展指令
-                    scan_cmd = self._build_diff_scan_cmd(task)
-                else:
-                    # 文件模式: 直接审查整个文件
-                    quoted_file = shlex.quote(task.file_path)
-                    scan_cmd = f"nga run 'review {quoted_file}'"
-
-                logger.debug(f"[{task.task_id}] Send: {scan_cmd[:200]}...")
-                proc.stdin.write(scan_cmd.encode("utf-8") + b"\n")
-                await proc.stdin.drain()
-
-                # 3. 动态等待 nga 处理完毕（空闲检测）
-                idle_timeout = self.idle_timeout
-                wait_start = time.time()
-                wait_task = asyncio.create_task(proc.wait())
-
-                logger.debug(
-                    f"[{task.task_id}] Waiting for nga to finish "
-                    f"(idle_timeout={idle_timeout}s, max={self.session_timeout}s)..."
-                )
-
-                while True:
-                    await asyncio.sleep(0.5)
-
-                    # 硬超时检查
-                    if time.time() - wait_start > self.session_timeout:
-                        raise asyncio.TimeoutError
-
-                    # 进程自然结束
-                    if wait_task.done():
-                        break
-
-                    # 空闲检测：连续 idle_timeout 秒无新输出
-                    if time.time() - last_output_time > idle_timeout:
-                        logger.debug(
-                            f"[{task.task_id}] Idle for {idle_timeout}s, preparing to exit"
-                        )
-                        break
-
-                # 4. 发送退出命令（如果进程还在运行）
-                if not wait_task.done():
-                    exit_cmd = "nga run '/exit'"
-                    logger.debug(f"[{task.task_id}] Send: {exit_cmd}")
-                    proc.stdin.write(exit_cmd.encode("utf-8") + b"\n")
-                    await proc.stdin.drain()
-
-                proc.stdin.close()
-                await proc.stdin.wait_closed()
-
-                # 5. 等待进程结束（如果还没结束的话）
-                if not wait_task.done():
-                    try:
-                        task.returncode = await asyncio.wait_for(proc.wait(), timeout=30)
-                        logger.debug(
-                            f"[{task.task_id}] Process exited with code {task.returncode}"
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            f"[{task.task_id}] Timeout waiting for exit, killing..."
-                        )
-                        proc.kill()
-                        await proc.wait()
-                        task.returncode = -1
-                        task.error = "Timeout waiting for exit after /exit"
-                else:
-                    task.returncode = wait_task.result()
-                    logger.debug(
-                        f"[{task.task_id}] Process exited naturally with code {task.returncode}"
+                # 3. 等待 nga 进程结束（带超时）
+                try:
+                    task.returncode = await asyncio.wait_for(
+                        proc.wait(), timeout=self.session_timeout
                     )
+                    logger.debug(
+                        f"[{task.task_id}] Process exited with code {task.returncode}"
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[{task.task_id}] Timeout after {self.session_timeout}s, killing..."
+                    )
+                    proc.kill()
+                    await proc.wait()
+                    task.returncode = -1
+                    task.error = f"Timeout after {self.session_timeout}s"
 
                 # 等待读取任务完成（进程结束后 pipe 会 EOF，读取任务自然退出）
                 await asyncio.gather(stdout_task, stderr_task)
@@ -666,13 +596,19 @@ class OpenCodeOrchestrator:
                         f"[{task.task_id}] FAILED (code={task.returncode}) | {task.file_path} | {task.error}"
                     )
 
-                # 7. 生成 Markdown 报告（只含审查结果）和日志文件（含 stderr）
+                # 7. 生成 Markdown 报告（只含审查结果）
                 report_md = generate_report(task)
                 Path(task.report_file).write_text(report_md, encoding="utf-8")
                 logger.debug(f"[{task.task_id}] Report saved: {task.report_file}")
 
-                log_content = generate_log(task)
-                Path(task.log_file).write_text(log_content, encoding="utf-8")
+                # 追加尾部统计到 .log 文件并关闭
+                log_fh.write("\n=== End ===\n")
+                log_fh.write(f"Status: {task.status}\n")
+                log_fh.write(f"Duration: {task.duration}s\n")
+                log_fh.write(f"Return code: {task.returncode}\n")
+                if task.error:
+                    log_fh.write(f"Error: {task.error}\n")
+                log_fh.close()
                 logger.debug(f"[{task.task_id}] Log saved: {task.log_file}")
 
                 tracker.complete_task(success=(task.status == "done"))
@@ -682,6 +618,13 @@ class OpenCodeOrchestrator:
                 task.end_time = time.time()
                 task.error = str(e)
                 logger.error(f"[{task.task_id}] EXCEPTION: {e}")
+                # 确保 log 文件被关闭，并追加异常信息
+                try:
+                    if "log_fh" in locals() and log_fh is not None and not log_fh.closed:
+                        log_fh.write(f"\n=== Exception ===\n{e}\n")
+                        log_fh.close()
+                except Exception:
+                    pass
                 tracker.complete_task(success=False)
 
     def _save_summary(self, total_time: float):
@@ -714,8 +657,8 @@ def main():
   # 递归扫描目录
   python orchestrator.py --files app/a app/b -c 3
 
-  # 调整空闲检测超时（连续无输出多少秒后发送 /exit）和会话总超时
-  python orchestrator.py --diff abc123 --scan-delay 20 --timeout 600
+  # 调整会话总超时
+  python orchestrator.py --diff abc123 --timeout 600
         """,
     )
 
@@ -754,12 +697,6 @@ def main():
         help="nga 可执行文件路径（默认: nga）",
     )
     parser.add_argument(
-        "--scan-delay",
-        type=int,
-        default=10,
-        help="空闲检测超时(秒)：nga 连续无输出多久后自动发送 /exit（默认: 10）",
-    )
-    parser.add_argument(
         "--timeout",
         type=int,
         default=300,
@@ -773,7 +710,6 @@ def main():
         concurrency=args.concurrency,
         nga_bin=args.nga,
         session_timeout=args.timeout,
-        scan_delay=args.scan_delay,
     )
 
     # 解析 cared_paths
