@@ -518,6 +518,15 @@ class OpenCodeOrchestrator:
             logger.info(f"[{task.task_id}] START {task.file_path}")
 
             try:
+                # 0. 按 diff 行数计算动态超时
+                diff_lines = len(task.diff_content.splitlines()) if task.diff_content else 0
+                extra = (diff_lines // 10) * 60
+                session_timeout = min(300 + extra, 900)
+                logger.info(
+                    f"[{task.task_id}] Diff lines: {diff_lines}, "
+                    f"session timeout: {session_timeout}s"
+                )
+
                 # 1. 构造命令参数
                 if task.diff_content:
                     message = self._build_diff_scan_cmd(task)
@@ -573,31 +582,54 @@ class OpenCodeOrchestrator:
                     _read_stream(proc.stderr, stderr_chunks, "ERR", log_fh)
                 )
 
-                # 3. 等待 nga 进程结束（带超时）
+                # 3. 等待 nga 进程结束（软超时 SIGTERM + 硬超时 SIGKILL）
+                soft_timeout = max(session_timeout - 30, int(session_timeout * 0.9))
                 try:
                     task.returncode = await asyncio.wait_for(
-                        proc.wait(), timeout=self.session_timeout
+                        proc.wait(), timeout=soft_timeout
                     )
                     logger.debug(
                         f"[{task.task_id}] Process exited with code {task.returncode}"
                     )
                 except asyncio.TimeoutError:
-                    elapsed = time.time() - task.start_time
-                    last_out_ago = time.time() - io_stats["last_output_time"]
-                    diag = (
-                        f"Timeout after {self.session_timeout}s | "
-                        f"Last output: {last_out_ago:.1f}s ago | "
-                        f"Total bytes: {io_stats['total_bytes']}"
+                    # 软超时：优雅关闭，给 nga 机会 flush 部分结果
+                    logger.warning(
+                        f"[{task.task_id}] Soft timeout ({soft_timeout}s), "
+                        f"sending SIGTERM to let nga flush partial results..."
                     )
-                    logger.warning(f"[{task.task_id}] {diag}")
-                    log_fh.write("\n=== Timeout ===\n")
-                    log_fh.write(f"Total runtime: {elapsed:.1f}s\n")
-                    log_fh.write(f"Last output received: {last_out_ago:.1f}s ago\n")
-                    log_fh.write(f"Total bytes collected: {io_stats['total_bytes']}\n")
-                    proc.kill()
-                    await proc.wait()
-                    task.returncode = -1
-                    task.error = diag
+                    log_fh.write("\n=== Soft Timeout ===\n")
+                    log_fh.write(
+                        f"Sent SIGTERM at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    )
+                    proc.send_signal(signal.SIGTERM)
+
+                    try:
+                        task.returncode = await asyncio.wait_for(proc.wait(), timeout=30)
+                        logger.info(
+                            f"[{task.task_id}] Graceful shutdown after SIGTERM"
+                        )
+                    except asyncio.TimeoutError:
+                        # 硬超时：强制 kill
+                        elapsed = time.time() - task.start_time
+                        last_out_ago = time.time() - io_stats["last_output_time"]
+                        diag = (
+                            f"Hard timeout after {session_timeout}s | "
+                            f"Last output: {last_out_ago:.1f}s ago | "
+                            f"Total bytes: {io_stats['total_bytes']}"
+                        )
+                        logger.warning(f"[{task.task_id}] {diag}")
+                        log_fh.write("\n=== Hard Timeout ===\n")
+                        log_fh.write(f"Total runtime: {elapsed:.1f}s\n")
+                        log_fh.write(
+                            f"Last output received: {last_out_ago:.1f}s ago\n"
+                        )
+                        log_fh.write(
+                            f"Total bytes collected: {io_stats['total_bytes']}\n"
+                        )
+                        proc.kill()
+                        await proc.wait()
+                        task.returncode = -1
+                        task.error = diag
 
                 # 等待读取任务完成（进程结束后 pipe 会 EOF，读取任务自然退出）
                 await asyncio.gather(stdout_task, stderr_task)
