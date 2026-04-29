@@ -508,7 +508,9 @@ class OpenCodeOrchestrator:
         """扫描单个文件"""
         async with self.semaphore:
             if self._shutdown:
-                logger.warning(f"[{task.task_id}] Skipped (shutdown)")
+                logger.warning(
+                    f"[{task.task_id}] {task.file_path} | Skipped (shutdown)"
+                )
                 return
 
             task.status = "running"
@@ -523,7 +525,7 @@ class OpenCodeOrchestrator:
                 extra = (diff_lines // 10) * 60
                 session_timeout = min(300 + extra, 900)
                 logger.info(
-                    f"[{task.task_id}] Diff lines: {diff_lines}, "
+                    f"[{task.task_id}] {task.file_path} | Diff lines: {diff_lines}, "
                     f"session timeout: {session_timeout}s"
                 )
 
@@ -594,8 +596,9 @@ class OpenCodeOrchestrator:
                 except asyncio.TimeoutError:
                     # 软超时：优雅关闭，给 nga 机会 flush 部分结果
                     logger.warning(
-                        f"[{task.task_id}] Soft timeout ({soft_timeout}s), "
-                        f"sending SIGTERM to let nga flush partial results..."
+                        f"[{task.task_id}] {task.file_path} | Soft timeout "
+                        f"({soft_timeout}s), sending SIGTERM to let nga flush "
+                        f"partial results..."
                     )
                     log_fh.write("\n=== Soft Timeout ===\n")
                     log_fh.write(
@@ -606,7 +609,8 @@ class OpenCodeOrchestrator:
                     try:
                         task.returncode = await asyncio.wait_for(proc.wait(), timeout=30)
                         logger.info(
-                            f"[{task.task_id}] Graceful shutdown after SIGTERM"
+                            f"[{task.task_id}] {task.file_path} | "
+                            f"Graceful shutdown after SIGTERM"
                         )
                     except asyncio.TimeoutError:
                         # 硬超时：强制 kill
@@ -617,7 +621,9 @@ class OpenCodeOrchestrator:
                             f"Last output: {last_out_ago:.1f}s ago | "
                             f"Total bytes: {io_stats['total_bytes']}"
                         )
-                        logger.warning(f"[{task.task_id}] {diag}")
+                        logger.warning(
+                            f"[{task.task_id}] {task.file_path} | {diag}"
+                        )
                         log_fh.write("\n=== Hard Timeout ===\n")
                         log_fh.write(f"Total runtime: {elapsed:.1f}s\n")
                         log_fh.write(
@@ -673,7 +679,9 @@ class OpenCodeOrchestrator:
                 task.status = "failed"
                 task.end_time = time.time()
                 task.error = str(e)
-                logger.error(f"[{task.task_id}] EXCEPTION: {e}")
+                logger.error(
+                    f"[{task.task_id}] {task.file_path} | EXCEPTION: {e}"
+                )
                 # 确保 log 文件被关闭，并追加异常信息
                 try:
                     if "log_fh" in locals() and log_fh is not None and not log_fh.closed:
