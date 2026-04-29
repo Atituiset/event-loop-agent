@@ -63,8 +63,10 @@ python orchestrator.py --diff abc123 --paths src/rr,src/mac --repo . -c 3
 1. 执行 `git diff abc123..HEAD --name-only` 获取变更文件
 2. 过滤出 C/C++ 文件（`.c`, `.cc`, `.cpp`, `.h`, `.hpp`）
 3. 如果指定了 `--paths`，只保留这些目录下的文件
-4. **每个文件一个独立的 nga session**
-5. 并发控制为 3，处理完一个立即关闭，接着处理下一个
+4. 对每个文件执行 `git diff abc123..HEAD -- <file>` 提取 diff 内容
+5. **每个文件一个独立的 nga session**，将 diff 内容 + 上下文扩展指令发送给 nga
+6. nga 收到指令后会：基于 diff 审查变更代码；若变更在函数内，自动扩展至函数完整实现、caller、callee；若变更涉及全局变量/结构体/枚举，自动找到所有使用点
+7. 并发控制为 3，处理完一个立即关闭，接着处理下一个
 
 ### 模式二：文件列表模式
 
@@ -95,28 +97,32 @@ Progress: 25/25 (100%) | Running: 0 | Failed: 0 | Elapsed: 120s
 
 ## 输出结构
 
-输出路径按文件相对于 `cared_path`（或当前工作目录）的目录结构组织：
+输出路径按文件的**完整相对路径**组织，保留 `cared_path` 前缀：
 
 ```
 reports/20250429_143052/
 ├── summary.md                    # 汇总报告
-├── abc/cde/efg/                  # 文件在 cared_path 下的相对目录
+├── orchestrator.log              # 全局执行日志
+├── src/rr/abc/cde/efg/           # 完整相对目录（保留 cared_path 前缀）
 │   ├── Hello.md                  # 审查报告（只含 nga 审查结果）
 │   ├── Hello.log                 # 运行日志（含 stderr、错误信息）
+│   ├── Hello.diff                # diff 内容（Diff 模式）
 │   ├── World.md
-│   └── World.log
-└── scheduler/
+│   ├── World.log
+│   └── World.diff
+└── src/mac/scheduler/
     ├── scheduler.md
-    └── scheduler.log
+    ├── scheduler.log
+    └── scheduler.diff
 ```
 
 **路径计算示例**：
 
-| 文件路径 | cared_path | 相对路径 | 输出目录 |
-|---------|-----------|---------|---------|
-| `src/rr/abc/cde/efg/Hello.c` | `src/rr` | `abc/cde/efg/Hello.c` | `reports/abc/cde/efg/Hello.{md,log}` |
-| `src/mac/scheduler.c` | `src/rr,src/mac` | `scheduler.c` | `reports/scheduler.{md,log}` |
-| `app/a/main.c` | 无 | `app/a/main.c` | `reports/app/a/main.{md,log}` |
+| 文件路径 | cared_path | 输出目录 |
+|---------|-----------|---------|
+| `src/rr/abc/cde/efg/Hello.c` | `src/rr` | `reports/src/rr/abc/cde/efg/Hello.{md,log,diff}` |
+| `src/mac/scheduler.c` | `src/rr,src/mac` | `reports/src/mac/scheduler.{md,log,diff}` |
+| `app/a/main.c` | 无 | `reports/app/a/main.{md,log}` |
 
 **Markdown 报告内容**：直接展示 nga 的审查结果（stdout），不包装在代码块内。
 

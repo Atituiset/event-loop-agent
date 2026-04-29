@@ -17,7 +17,9 @@ OpenCode Agent 并行调度器 (Orchestrator)
 
 nga 交互方式:
   - 启动 nga 子进程 (stdin/stdout/stderr 均为 PIPE)
-  - 发送: nga run 'review <file_path>'
+  - Diff 模式: 发送 diff 内容 + 上下文扩展指令
+    （提示 nga 审查函数完整实现、caller、callee、全局符号使用点）
+  - 文件模式: 发送: nga run 'review <file_path>'
   - 等待 scan_delay 秒（给 nga 时间审查）
   - 发送: nga run '/exit' 关闭进程
   - 收集 stdout 作为审查结果，stderr 作为运行日志
@@ -27,13 +29,15 @@ nga 交互方式:
   - 终端: 实时进度日志
   - reports/YYYYMMDD_HHMMSS/<relative_path>/<file>.md: Markdown 审查报告
   - reports/YYYYMMDD_HHMMSS/<relative_path>/<file>.log: 运行日志（含 stderr）
+  - reports/YYYYMMDD_HHMMSS/<relative_path>/<file>.diff: diff 内容（Diff 模式）
   - reports/YYYYMMDD_HHMMSS/summary.md: 汇总报告
+  - reports/YYYYMMDD_HHMMSS/orchestrator.log: 全局执行日志
 
 输出路径规则:
-  - 报告和日志按文件相对于 cared_path（或当前工作目录）的目录结构存放
+  - 报告和日志按文件的完整相对路径存放，保留 cared_path 前缀
   - 示例: cared_path=src/rr, 文件=src/rr/abc/cde/efg/Hello.c
-    -> reports/20250429/abc/cde/efg/Hello.md
-    -> reports/20250429/abc/cde/efg/Hello.log
+    -> reports/20250429/src/rr/abc/cde/efg/Hello.md
+    -> reports/20250429/src/rr/abc/cde/efg/Hello.log
 """
 
 import argparse
@@ -85,6 +89,8 @@ class ScanTask:
     stderr: str = ""         # nga stderr
     error: str = ""          # 错误信息
     returncode: Optional[int] = None
+    diff_content: str = ""   # diff 模式: 该文件的 diff 内容
+    diff_file: str = ""      # diff 模式: diff 内容保存的文件路径
 
     @property
     def duration(self) -> float:
@@ -277,11 +283,26 @@ class OpenCodeOrchestrator:
         self.tasks: list[ScanTask] = []
         self.semaphore = asyncio.Semaphore(concurrency)
         self._shutdown = False
+        self.repo_path: Optional[Path] = None
+        self.start_commit: Optional[str] = None
 
         # 输出目录
         self.output_dir = Path("reports") / datetime.now().strftime("%Y%m%d_%H%M%S")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Output directory: {self.output_dir}")
+
+        # 全局日志文件 (orchestrator.log)
+        self.log_file = self.output_dir / "orchestrator.log"
+        # 移除已有的 file handlers，避免重复
+        for h in logger.handlers[:]:
+            if isinstance(h, logging.FileHandler):
+                logger.removeHandler(h)
+                h.close()
+        file_handler = logging.FileHandler(self.log_file, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
+        logger.addHandler(file_handler)
+        logger.debug(f"Global log file: {self.log_file}")
 
     # ------------------------------------------------------------------
     #  路径计算
@@ -292,27 +313,15 @@ class OpenCodeOrchestrator:
         计算报告和日志的输出路径。
 
         规则：
-        1. 如果指定了 cared_paths，使用文件相对于第一个匹配的 cared_path 的路径
-        2. 如果没有 cared_paths，使用文件相对于当前工作目录的路径
+        - 使用文件路径的完整相对路径作为目录结构，保留 cared_path 前缀
+        - 这样不同 cared_path 的文件不会混在一起
 
         示例:
           cared_path=src/rr, file=src/rr/abc/cde/efg/Hello.c
-          -> sub_dir=abc/cde/efg, stem=Hello
-          -> reports/20250429/abc/cde/efg/Hello.md
+          -> sub_dir=src/rr/abc/cde/efg, stem=Hello
+          -> reports/20250429/src/rr/abc/cde/efg/Hello.md
         """
-        rel_path = file_path
-
-        if cared_paths:
-            for cp in cared_paths:
-                cp = cp.rstrip("/")
-                if file_path.startswith(cp + "/"):
-                    rel_path = file_path[len(cp) + 1:]  # 去掉 cp/ 前缀
-                    break
-                elif file_path == cp:
-                    rel_path = Path(file_path).name
-                    break
-
-        path_obj = Path(rel_path)
+        path_obj = Path(file_path)
         sub_dir = path_obj.parent
         file_stem = path_obj.stem
 
@@ -365,8 +374,10 @@ class OpenCodeOrchestrator:
         logger.info(f"File mode: {len(self.tasks)} files")
 
     def setup_diff_mode(self, start_commit: str, repo_path: str = ".", cared_paths: Optional[list[str]] = None):
-        """Diff 模式: 提取变更文件"""
+        """Diff 模式: 提取变更文件及其 diff 内容"""
         repo = Path(repo_path).resolve()
+        self.repo_path = repo
+        self.start_commit = start_commit
         logger.info(f"Diff mode: repo={repo}, start_commit={start_commit}")
 
         changed_files = self._get_changed_files(repo, start_commit)
@@ -386,11 +397,23 @@ class OpenCodeOrchestrator:
 
         for i, fp in enumerate(changed_files, 1):
             report_file, log_file = self._get_output_paths(fp, cared_paths)
+
+            # 提取该文件的 diff 内容
+            diff_content = self._get_file_diff(repo, start_commit, fp)
+            diff_file = ""
+            if diff_content:
+                diff_path = Path(report_file).parent / f"{Path(fp).stem}.diff"
+                diff_path.write_text(diff_content, encoding="utf-8")
+                diff_file = str(diff_path)
+                logger.debug(f"[{i:03d}] Diff saved: {diff_path}")
+
             self.tasks.append(ScanTask(
                 file_path=fp,
                 task_id=f"task-{i:03d}",
                 report_file=str(report_file),
                 log_file=str(log_file),
+                diff_content=diff_content,
+                diff_file=diff_file,
             ))
 
     def _get_changed_files(self, repo: Path, start_commit: str) -> list[str]:
@@ -400,6 +423,8 @@ class OpenCodeOrchestrator:
                 ["git", "-C", str(repo), "diff", "--diff-filter=AM", "--name-only", f"{start_commit}..HEAD"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=30,
                 check=True,
             )
@@ -412,6 +437,26 @@ class OpenCodeOrchestrator:
         except Exception as e:
             logger.error(f"Failed to get changed files: {e}")
             return []
+
+    @staticmethod
+    def _get_file_diff(repo: Path, start_commit: str, file_path: str) -> str:
+        """执行 git diff 获取单个文件的 diff 内容"""
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo), "diff", f"{start_commit}..HEAD", "--", file_path],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=True,
+            )
+            return result.stdout
+        except subprocess.CalledProcessError:
+            return ""
+        except Exception as e:
+            logger.warning(f"Failed to get diff for {file_path}: {e}")
+            return ""
 
     @staticmethod
     def _filter_by_cared_paths(file_paths: list[str], cared_paths: list[str]) -> list[str]:
@@ -453,6 +498,24 @@ class OpenCodeOrchestrator:
         total_time = sum(t.duration for t in self.tasks)
         self._save_summary(total_time)
 
+    def _build_diff_scan_cmd(self, task: ScanTask) -> str:
+        """Diff 模式下构造审查命令，包含 diff 内容和上下文扩展指令"""
+        # 简单处理单引号：替换为反引号，避免破坏 nga run '...' 格式
+        diff_safe = task.diff_content.replace("'", "`")
+
+        message = (
+            f"请审查文件 {task.file_path} 的以下代码变更：\n\n"
+            f"{diff_safe}\n\n"
+            f"审查要求：\n"
+            f"1. 应用无线通信安全编码规则（RULE-001~RULE-010）对变更代码进行检查\n"
+            f"2. 如果变更在函数内部，请同时审查该函数的完整实现，包括："
+            f"函数内所有变量的定义和声明、该函数的调用者（caller）、该函数调用的其他函数（callee）\n"
+            f"3. 如果变更涉及全局变量、结构体声明、枚举声明等不在函数体内的代码，"
+            f"请找到该符号的所有使用点并一并审查\n"
+            f"4. 对每个发现的问题提供：文件路径、行号、问题描述、代码片段、修复建议、置信度"
+        )
+        return f"nga run '{message}'"
+
     async def _scan_one(self, task: ScanTask, tracker: ProgressTracker):
         """扫描单个文件"""
         async with self.semaphore:
@@ -475,11 +538,16 @@ class OpenCodeOrchestrator:
                     stderr=asyncio.subprocess.PIPE,
                 )
 
-                # 2. 发送扫描命令
-                quoted_file = shlex.quote(task.file_path)
-                scan_cmd = f"nga run 'review {quoted_file}'"
+                # 2. 构造并发送扫描命令
+                if task.diff_content:
+                    # Diff 模式: 发送 diff 内容 + 上下文扩展指令
+                    scan_cmd = self._build_diff_scan_cmd(task)
+                else:
+                    # 文件模式: 直接审查整个文件
+                    quoted_file = shlex.quote(task.file_path)
+                    scan_cmd = f"nga run 'review {quoted_file}'"
 
-                logger.debug(f"[{task.task_id}] Send: {scan_cmd}")
+                logger.debug(f"[{task.task_id}] Send: {scan_cmd[:200]}...")
                 proc.stdin.write(scan_cmd.encode("utf-8") + b"\n")
                 await proc.stdin.drain()
 
