@@ -54,6 +54,7 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -277,6 +278,11 @@ class OpenCodeOrchestrator:
         self.tasks: list[ScanTask] = []
         self.semaphore = asyncio.Semaphore(concurrency)
         self._shutdown = False
+
+        # 检查 ngaent 清理命令是否可用（用于清理 nga 残留的并发锁文件）
+        self._cleanup_available = shutil.which("ngaent") is not None
+        if self._cleanup_available:
+            logger.debug("ngaent cleanup available")
         self.repo_path: Optional[Path] = None
         self.start_commit: Optional[str] = None
 
@@ -698,6 +704,20 @@ class OpenCodeOrchestrator:
                 except Exception:
                     pass
                 tracker.complete_task(success=False)
+
+        # 在 semaphore 块外执行清理，不占用并发槽位
+        if self._cleanup_available:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ngaent",
+                    "--cleanup-concurrency",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=5)
+                logger.debug(f"[{task.task_id}] Cleanup done")
+            except Exception as e:
+                logger.debug(f"[{task.task_id}] Cleanup skipped: {e}")
 
     def _save_summary(self, total_time: float):
         """保存 Markdown 汇总报告"""
