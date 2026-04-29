@@ -294,9 +294,36 @@ class OpenCodeOrchestrator:
     #  任务初始化
     # ------------------------------------------------------------------
 
-    def setup_file_mode(self, file_paths: list[str]):
-        """文件列表模式"""
-        for i, fp in enumerate(file_paths, 1):
+    def setup_file_mode(self, file_paths: list[str], cared_paths: Optional[list[str]] = None):
+        """文件列表模式
+
+        - 如果传入的是文件，直接加入任务队列
+        - 如果传入的是目录，递归扫描目录下的 C/C++ 文件
+        - 路径统一用相对路径（相对于当前工作目录）
+        """
+        all_files: list[str] = []
+        c_extensions = (".c", ".cc", ".cpp", ".h", ".hpp")
+        cwd = Path.cwd()
+
+        for fp in file_paths:
+            path = Path(fp)
+            if path.is_file():
+                # 统一转换为相对路径
+                rel_path = path.relative_to(cwd) if path.is_absolute() else path
+                all_files.append(str(rel_path))
+            elif path.is_dir():
+                # 递归扫描目录下的 C/C++ 文件，统一用相对路径
+                for ext in c_extensions:
+                    for p in path.rglob(f"*{ext}"):
+                        rel_path = p.relative_to(cwd) if p.is_absolute() else p
+                        all_files.append(str(rel_path))
+            else:
+                logger.warning(f"Path not found: {fp}")
+
+        # 去重并排序
+        all_files = sorted(set(all_files))
+
+        for i, fp in enumerate(all_files, 1):
             self.tasks.append(ScanTask(
                 file_path=fp,
                 task_id=f"task-{i:03d}",
@@ -304,8 +331,13 @@ class OpenCodeOrchestrator:
             ))
         logger.info(f"File mode: {len(self.tasks)} files")
 
-    def setup_diff_mode(self, start_commit: str, repo_path: str = "."):
-        """Diff 模式: 提取变更文件"""
+    def setup_diff_mode(self, start_commit: str, repo_path: str = ".", cared_paths: Optional[list[str]] = None):
+        """Diff 模式: 提取变更文件
+
+        - 执行 git diff 获取从 start_commit 到 HEAD 的变更文件
+        - 过滤 C/C++ 文件
+        - 如果指定了 cared_paths，只保留在 cared_paths 中的文件
+        """
         repo = Path(repo_path).resolve()
         logger.info(f"Diff mode: repo={repo}, start_commit={start_commit}")
 
@@ -319,12 +351,35 @@ class OpenCodeOrchestrator:
         changed_files = [f for f in changed_files if f.endswith(c_extensions)]
         logger.info(f"C/C++ changed files: {len(changed_files)}")
 
+        # 如果指定了 cared_paths，过滤
+        if cared_paths:
+            changed_files = self._filter_by_cared_paths(changed_files, cared_paths)
+            logger.info(f"After cared_paths filter: {len(changed_files)} files")
+
         for i, fp in enumerate(changed_files, 1):
             self.tasks.append(ScanTask(
                 file_path=fp,
                 task_id=f"task-{i:03d}",
                 report_file=str(self.output_dir / f"report_{i:03d}_{Path(fp).name}.md"),
             ))
+
+    @staticmethod
+    def _filter_by_cared_paths(file_paths: list[str], cared_paths: list[str]) -> list[str]:
+        """过滤出路径前缀匹配 cared_paths 的文件
+
+        使用精确匹配：文件路径必须等于 cared_path，或在 cared_path 的子目录下。
+        避免误判（如 app/a_test.c 不会被匹配到 app/a）。
+        """
+        # 标准化 cared_paths（去掉尾部斜杠）
+        normalized_cared = [cp.rstrip("/") for cp in cared_paths]
+        filtered = []
+        for fp in file_paths:
+            for cp in normalized_cared:
+                # 精确匹配：文件路径等于 cared_path，或以 cared_path/ 开头
+                if fp == cp or fp.startswith(cp + "/"):
+                    filtered.append(fp)
+                    break
+        return filtered
 
     def _get_changed_files(self, repo: Path, start_commit: str) -> list[str]:
         """执行 git diff 获取变更文件列表"""
@@ -486,8 +541,14 @@ def main():
   # Diff 模式（自动提取变更文件）
   python orchestrator.py --diff abc123 --repo ./app -c 3
 
+  # 只扫描指定目录下的变更文件
+  python orchestrator.py --diff abc123 --paths app/a,app/b --repo . -c 3
+
   # 文件列表模式
   python orchestrator.py --files file1.c file2.c file3.c -c 3
+
+  # 递归扫描目录
+  python orchestrator.py --files app/a app/b -c 3
 
   # 调整扫描等待时间和超时
   python orchestrator.py --diff abc123 --scan-delay 20 --timeout 600
@@ -508,6 +569,10 @@ def main():
         help="起始 commit hash，自动提取从该 commit 到 HEAD 的变更文件",
     )
 
+    parser.add_argument(
+        "--paths",
+        help="关注的相对目录，逗号分隔（如 app/a,app/b）。Diff 模式下只保留这些目录下的变更文件；文件列表模式下递归扫描这些目录",
+    )
     parser.add_argument(
         "--repo",
         default=".",
@@ -547,11 +612,17 @@ def main():
         scan_delay=args.scan_delay,
     )
 
+    # 解析 cared_paths
+    cared_paths = None
+    if args.paths:
+        cared_paths = [p.strip().rstrip("/") for p in args.paths.split(",")]
+        logger.info(f"Cared paths: {cared_paths}")
+
     # 初始化任务
     if args.diff:
-        orch.setup_diff_mode(start_commit=args.diff, repo_path=args.repo)
+        orch.setup_diff_mode(start_commit=args.diff, repo_path=args.repo, cared_paths=cared_paths)
     else:
-        orch.setup_file_mode(file_paths=args.files)
+        orch.setup_file_mode(file_paths=args.files, cared_paths=cared_paths)
 
     if not orch.tasks:
         logger.error("No files to scan. Exiting.")

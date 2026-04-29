@@ -60,10 +60,14 @@ python orchestrator.py --diff abc123 --repo . -c 3
 
 ### 模式二：文件列表模式
 
-手动指定要扫描的文件：
+手动指定要扫描的文件或目录（目录会自动递归扫描）：
 
 ```bash
+# 指定文件
 python orchestrator.py --files file1.c file2.c file3.c -c 3
+
+# 指定目录（递归扫描目录及子目录下的所有 C/C++ 文件）
+python orchestrator.py --files app/a app/b -c 3
 ```
 
 ### 终端输出示例
