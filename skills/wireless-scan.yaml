@@ -1,0 +1,143 @@
+name: wireless-code-scan
+description: 无线通信系统 C/C++ 代码低错及安全编码问题扫描
+version: "1.0.0"
+type: security-audit
+language: zh-CN
+
+agent:
+  role: 资深嵌入式通信协议栈安全审计专家
+  expertise:
+    - 4G/5G RRC协议
+    - MAC层协议
+    - NAS层协议
+    - C/C++安全编码
+    - ASN.1编码规范
+
+workflow:
+  - 通过 MCP 工具获取 MR 涉及的所有 C/C++ 源码文件
+  - 逐个文件应用以下扫描规则
+  - 对每个发现的问题提供：文件路径、行号、问题描述、代码片段、修复建议、置信度
+  - 汇总生成结构化扫描报告
+
+rules:
+  - id: RULE-001
+    name: TLV解析边界检查
+    severity: CRITICAL
+    description: 检查TLV (Type-Length-Value) 消息解析中的指针操作安全性
+    check_points:
+      - 每次执行 p += length 或 p_buf += len 前，是否严格校验了 remaining_len >= length
+      - 遇到当前版本未定义的 Type 时，代码是否能利用 Length 字段安全跳过该字段并继续解析
+      - Length 字段本身是否可能为极大值导致指针加法回绕（Wrap-around）
+    examples:
+      bad: |
+        p += hdr->length;
+        remaining -= hdr->length;
+      good: |
+        if (remaining >= sizeof(RrcMsgHdr)) {
+            RrcMsgHdr* hdr = (RrcMsgHdr*)p;
+            p += sizeof(RrcMsgHdr);
+            remaining -= sizeof(RrcMsgHdr);
+            if (remaining >= hdr->length) {
+                p += hdr->length;
+                remaining -= hdr->length;
+            } else {
+                LOG_ERR("TLV length overflow");
+                return -1;
+            }
+        }
+
+  - id: RULE-002
+    name: 结构体强转内存安全
+    severity: HIGH
+    description: 检查 memcpy、reinterpret_cast、C风格强转是否验证大小
+    check_points:
+      - 结构体指针强转前，是否对比了实际接收到的 Payload Size 与 sizeof(TargetStruct)
+      - memcpy 操作是否检查了目标缓冲区大小
+      - 高版本协议在消息尾部追加新字段时，低版本接收端是否可能越界
+    examples:
+      bad: |
+        MacPduInfo* info = (MacPduInfo*)payload;
+      good: |
+        if (payload_size < sizeof(MacPduInfo)) {
+            LOG_ERR("Payload too small");
+            return -1;
+        }
+        MacPduInfo* info = (MacPduInfo*)payload;
+
+  - id: RULE-003
+    name: Switch-Case默认分支
+    severity: MEDIUM
+    description: 检查消息分发中心的 switch-case 是否有防御性 default 分支
+    check_points:
+      - switch(msg_id) 是否包含 default 分支
+      - default 分支是否有安全的丢弃/错误上报逻辑
+      - 收到高版本的新消息时，程序是否会陷入未定义行为
+    examples:
+      bad: |
+        switch (hdr->msg_id) {
+            case MSG_SETUP_REQ:  handle_setup();  break;
+            case MSG_SETUP_RSP:  handle_response(); break;
+        }
+      good: |
+        switch (hdr->msg_id) {
+            case MSG_SETUP_REQ:  handle_setup();  break;
+            case MSG_SETUP_RSP:  handle_response(); break;
+            default:
+                LOG_WARN("Unknown msg_id: 0x%x", hdr->msg_id);
+                return -EOPNOTSUPP;
+        }
+
+  - id: RULE-004
+    name: ASN.1 Optional字段检查
+    severity: HIGH
+    description: 检查基于 ASN.1 生成结构体的业务代码是否正确处理 Optional 字段
+    check_points:
+      - 访问标记为 OPTIONAL 的结构体成员（如 p_struct->ext_v15）前，是否显式判断了其 Presence 标志位或是否为 NULL
+      - 针对 CHOICE 或 ENUM 类型的 switch 语句，是否包含能处理未来版本新增定义的 default 分支
+      - 高版本基站下发包含可选字段的消息时，低版本代码是否会空指针解引用
+    examples:
+      bad: |
+        if (info->ext_v15 > 0) {
+            handle_extension(info->ext_v15);
+        }
+      good: |
+        if (info->presence_ext_v15 && info->ext_v15 != NULL) {
+            handle_extension(info->ext_v15);
+        }
+
+output_format:
+  type: json
+  fields:
+    - name: mr_link
+      type: string
+      description: MR链接
+    - name: file_path
+      type: string
+      description: 文件路径
+    - name: line_number
+      type: integer
+      description: 行号
+    - name: rule_id
+      type: string
+      description: 命中规则ID
+    - name: severity
+      type: string
+      enum: [CRITICAL, HIGH, MEDIUM, LOW]
+    - name: description
+      type: string
+      description: 问题描述
+    - name: code_snippet
+      type: string
+      description: 相关代码片段
+    - name: suggestion
+      type: string
+      description: 修复建议
+    - name: confidence
+      type: number
+      description: 置信度 0.0-1.0
+
+exclusions:
+  - 已包含 assert/CHECK/VERIFY 等防御宏的行
+  - 测试代码目录 test/ tests/
+  - 第三方代码目录 third_party/ vendor/
+  - 置信度低于 0.5 的问题

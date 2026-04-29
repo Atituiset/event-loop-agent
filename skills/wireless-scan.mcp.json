@@ -1,0 +1,112 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "title": "Wireless Code Scan Skill",
+  "description": "无线通信系统 C/C++ 代码低错及安全编码问题扫描",
+  "properties": {
+    "name": {
+      "type": "string",
+      "const": "wireless-code-scan"
+    },
+    "description": {
+      "type": "string",
+      "const": "扫描无线通信系统 C/C++ 代码中的低错及安全问题"
+    },
+    "version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "mr_link": {
+          "type": "string",
+          "description": "要扫描的 MR 链接"
+        },
+        "scan_rules": {
+          "type": "array",
+          "description": "启用的扫描规则",
+          "items": {
+            "type": "string",
+            "enum": ["RULE-001", "RULE-002", "RULE-003", "RULE-004"]
+          }
+        }
+      },
+      "required": ["mr_link"]
+    }
+  },
+  "instructions": {
+    "role": "资深嵌入式通信协议栈安全审计专家，精通 4G/5G RRC/MAC/NAS 层协议和 C/C++ 安全编码",
+    "workflow": [
+      "通过 MCP 工具获取 MR 涉及的所有 C/C++ 源码文件",
+      "逐个文件应用扫描规则",
+      "对每个发现的问题提供文件路径、行号、问题描述、代码片段、修复建议、置信度",
+      "汇总生成结构化扫描报告"
+    ],
+    "rules": [
+      {
+        "id": "RULE-001",
+        "name": "TLV解析边界检查",
+        "severity": "CRITICAL",
+        "description": "检查TLV解析中的指针偏移操作是否有边界校验",
+        "check_points": [
+          "每次执行 p += length 前，是否校验 remaining_len >= length",
+          "遇到未知 Type 时，是否通过 Length 字段安全跳过",
+          "Length 字段是否为极大值导致指针回绕"
+        ]
+      },
+      {
+        "id": "RULE-002",
+        "name": "结构体强转内存安全",
+        "severity": "HIGH",
+        "description": "检查 memcpy、reinterpret_cast、C风格强转是否验证大小",
+        "check_points": [
+          "memcpy 前是否检查目标缓冲区大小",
+          "结构体指针强转前是否对比 Payload Size 与 sizeof(TargetStruct)",
+          "高版本新增字段是否导致低版本结构体越界"
+        ]
+      },
+      {
+        "id": "RULE-003",
+        "name": "Switch-Case默认分支",
+        "severity": "MEDIUM",
+        "description": "检查消息分发 switch 是否包含安全的 default 分支",
+        "check_points": [
+          "switch(msg_id) 是否包含 default 分支",
+          "default 分支是否有安全的丢弃/错误上报逻辑",
+          "收到高版本新消息时是否陷入未定义行为"
+        ]
+      },
+      {
+        "id": "RULE-004",
+        "name": "ASN.1 Optional字段检查",
+        "severity": "HIGH",
+        "description": "检查 ASN.1 生成的 Optional 字段访问前是否有存在性校验",
+        "check_points": [
+          "访问 ext_ 等 OPTIONAL 成员前是否检查 Presence 标志位",
+          "指针是否为 NULL 的判断",
+          "CHOICE/ENUM 的 switch 是否包含处理未来版本新增的 default"
+        ]
+      }
+    ],
+    "output_format": {
+      "type": "json",
+      "fields": [
+        {"name": "mr_link", "type": "string"},
+        {"name": "file_path", "type": "string"},
+        {"name": "line_number", "type": "integer"},
+        {"name": "rule_id", "type": "string"},
+        {"name": "severity", "type": "string", "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"]},
+        {"name": "description", "type": "string"},
+        {"name": "code_snippet", "type": "string"},
+        {"name": "suggestion", "type": "string"},
+        {"name": "confidence", "type": "number", "minimum": 0, "maximum": 1}
+      ]
+    },
+    "exclusions": [
+      "已包含 assert/CHECK/VERIFY 等防御宏的行",
+      "测试代码目录 test/ tests/",
+      "第三方代码目录 third_party/ vendor/"
+    ]
+  }
+}
