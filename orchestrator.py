@@ -64,6 +64,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+# Optional HTTP client for web debug interface (only used when --debug)
+try:
+    import httpx
+except ImportError:
+    httpx = None  # type: ignore
+
 # ANSI 转义序列过滤（用于清理 nga 终端控制输出，作为 TERM=dumb 的兜底）
 ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
@@ -105,6 +111,7 @@ class ScanTask:
     returncode: Optional[int] = None
     diff_content: str = ""   # diff 模式: 该文件的 diff 内容
     diff_file: str = ""      # diff 模式: diff 内容保存的文件路径
+    slot_id: Optional[int] = None  # debug 模式下分配的 web 终端槽位
 
     @property
     def duration(self) -> float:
@@ -254,6 +261,44 @@ def generate_summary(tasks: list[ScanTask], total_time: float) -> str:
 
 
 # ============================================================================
+# 槽位管理器（将 Semaphore 并发槽位显式化，映射到 Web 终端窗口）
+# ============================================================================
+
+class SlotManager:
+    """
+    为并发 nga 进程分配固定编号的槽位（slot）。
+    每个 slot 对应 web 界面中的一个终端窗口。
+    槽位数与 orchestrator 的 concurrency 一致（默认 3）。
+    """
+
+    def __init__(self, num_slots: int = 3):
+        self.num_slots = num_slots
+        self.slots: list[Optional[dict]] = [None] * num_slots
+        self._lock = asyncio.Lock()
+        self._event = asyncio.Event()
+        self._event.set()  # 初始有可用槽位
+
+    async def acquire(self, task_id: str, file_path: str) -> int:
+        """获取一个空闲槽位，返回 slot_id (0 ~ num_slots-1)。"""
+        while True:
+            async with self._lock:
+                for i in range(self.num_slots):
+                    if self.slots[i] is None:
+                        self.slots[i] = {"task_id": task_id, "file_path": file_path}
+                        if all(self.slots):
+                            self._event.clear()
+                        return i
+            # 没有可用槽位，等待 release 唤醒
+            await self._event.wait()
+
+    async def release(self, slot_id: int):
+        """释放指定槽位。"""
+        async with self._lock:
+            self.slots[slot_id] = None
+            self._event.set()
+
+
+# ============================================================================
 # Orchestrator 核心
 # ============================================================================
 
@@ -270,10 +315,14 @@ class OpenCodeOrchestrator:
         concurrency: int = 3,
         nga_bin: str = "nga",
         session_timeout: int = 600,
+        debug: bool = False,
+        web_port: int = 8080,
     ):
         self.concurrency = concurrency
         self.nga_bin = nga_bin
         self.session_timeout = session_timeout
+        self.debug = debug
+        self.web_port = web_port
 
         self.tasks: list[ScanTask] = []
         self.semaphore = asyncio.Semaphore(concurrency)
@@ -285,6 +334,17 @@ class OpenCodeOrchestrator:
             logger.debug("ngaent cleanup available")
         self.repo_path: Optional[Path] = None
         self.start_commit: Optional[str] = None
+
+        # debug 模式下的槽位管理和 web 服务器状态
+        self.slot_manager: Optional[SlotManager] = None
+        self.web_proc: Optional[subprocess.Popen] = None
+        self.web_client: Optional["httpx.AsyncClient"] = None  # type: ignore
+        if self.debug:
+            self.slot_manager = SlotManager(num_slots=concurrency)
+            if httpx is not None:
+                self.web_client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+            else:
+                logger.warning("httpx not installed, web debug will not work. Run: pip install httpx")
 
         # 输出目录
         self.output_dir = Path("reports") / datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -307,6 +367,106 @@ class OpenCodeOrchestrator:
         file_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
         logger.addHandler(file_handler)
         logger.debug(f"Global log file: {self.log_file}")
+
+    # ------------------------------------------------------------------
+    #  Web Debug 服务器管理
+    # ------------------------------------------------------------------
+
+    async def _start_web_server(self):
+        """启动 gunicorn 运行 web_server.py（FastAPI）。"""
+        if not self.debug or self.web_client is None:
+            return
+
+        script_dir = Path(__file__).parent.resolve()
+        web_cmd = [
+            sys.executable, "-m", "gunicorn",
+            "web_server:app",
+            "-k", "uvicorn.workers.UvicornWorker",
+            "--bind", f"0.0.0.0:{self.web_port}",
+            "--workers", "1",
+            "--access-logfile", "-",
+        ]
+        logger.info(f"Starting web debug server: http://localhost:{self.web_port}")
+        self.web_proc = subprocess.Popen(
+            web_cmd,
+            cwd=str(script_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        # 等待 web server 就绪（轮询 / 最多 5 秒）
+        for _ in range(50):
+            try:
+                resp = await self.web_client.get(f"http://localhost:{self.web_port}/")
+                if resp.status_code == 200:
+                    logger.info(f"Web debug interface ready: http://localhost:{self.web_port}")
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
+        logger.warning("Web server did not become ready within 5s")
+
+    async def _stop_web_server(self):
+        """停止 gunicorn web 服务器。"""
+        if self.web_proc is not None:
+            self.web_proc.terminate()
+            try:
+                self.web_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.web_proc.kill()
+                self.web_proc.wait()
+            self.web_proc = None
+            logger.info("Web debug server stopped")
+        if self.web_client is not None:
+            await self.web_client.aclose()
+            self.web_client = None
+
+    # ------------------------------------------------------------------
+    #  Web Debug HTTP API 调用
+    # ------------------------------------------------------------------
+
+    async def _web_acquire(self, slot_id: int, task_id: str, file_path: str):
+        if self.web_client is None:
+            return
+        try:
+            await self.web_client.post(
+                f"http://localhost:{self.web_port}/api/slot/{slot_id}/acquire",
+                json={"task_id": task_id, "file_path": file_path},
+            )
+        except Exception as e:
+            logger.debug(f"Web acquire failed: {e}")
+
+    async def _web_push(self, slot_id: int, log_type: str, content: str):
+        if self.web_client is None:
+            return
+        try:
+            await self.web_client.post(
+                f"http://localhost:{self.web_port}/api/slot/{slot_id}/push",
+                json={"log_type": log_type, "content": content},
+            )
+        except Exception as e:
+            logger.debug(f"Web push failed: {e}")
+
+    async def _web_status(self, slot_id: int, status: str, duration: float = 0.0):
+        if self.web_client is None:
+            return
+        try:
+            await self.web_client.post(
+                f"http://localhost:{self.web_port}/api/slot/{slot_id}/status",
+                json={"status": status, "duration": duration},
+            )
+        except Exception as e:
+            logger.debug(f"Web status failed: {e}")
+
+    async def _web_release(self, slot_id: int):
+        if self.web_client is None:
+            return
+        try:
+            await self.web_client.post(
+                f"http://localhost:{self.web_port}/api/slot/{slot_id}/release",
+            )
+        except Exception as e:
+            logger.debug(f"Web release failed: {e}")
 
     # ------------------------------------------------------------------
     #  路径计算
@@ -485,9 +645,14 @@ class OpenCodeOrchestrator:
             logger.warning("No tasks to run")
             return
 
+        # debug 模式下启动 web server
+        if self.debug:
+            await self._start_web_server()
+
         logger.info(
             f"=== Starting scan: {len(self.tasks)} files, "
-            f"concurrency={self.concurrency}, timeout={self.session_timeout}s ==="
+            f"concurrency={self.concurrency}, timeout={self.session_timeout}s "
+            f"debug={self.debug} ==="
         )
 
         tracker = ProgressTracker(len(self.tasks))
@@ -501,6 +666,10 @@ class OpenCodeOrchestrator:
         # 生成汇总报告
         total_time = sum(t.duration for t in self.tasks)
         self._save_summary(total_time)
+
+        # 扫描结束后关闭 web server
+        if self.debug:
+            await self._stop_web_server()
 
     def _build_diff_scan_cmd(self, task: ScanTask) -> str:
         """Diff 模式下构造审查提示词，指引 nga 读取 diff 文件并审查"""
@@ -533,6 +702,14 @@ class OpenCodeOrchestrator:
 
             logger.info(f"[{task.task_id}] START {task.file_path}")
 
+            # debug 模式下分配槽位并通知 web server
+            slot_id: Optional[int] = None
+            if self.debug and self.slot_manager is not None:
+                slot_id = await self.slot_manager.acquire(task.task_id, task.file_path)
+                task.slot_id = slot_id
+                await self._web_acquire(slot_id, task.task_id, task.file_path)
+                logger.info(f"[{task.task_id}] Assigned to web slot #{slot_id}")
+
             try:
                 # 0. 按 diff 行数计算动态超时
                 diff_lines = len(task.diff_content.splitlines()) if task.diff_content else 0
@@ -551,9 +728,14 @@ class OpenCodeOrchestrator:
 
                 logger.debug(f"[{task.task_id}] Command: nga run '{message[:200]}...'")
 
-                # 2. 启动 nga 子进程（命令行参数方式，TERM=dumb 避免 ANSI 乱码）
+                # 2. 启动 nga 子进程
+                # debug 模式下使用 TERM=xterm-256color 保留 ANSI 输出（捕获思考过程）
+                # 非 debug 模式下使用 TERM=dumb 过滤 ANSI
                 env = os.environ.copy()
-                env["TERM"] = "dumb"
+                if self.debug:
+                    env["TERM"] = "xterm-256color"
+                else:
+                    env["TERM"] = "dumb"
                 proc = await asyncio.create_subprocess_exec(
                     self.nga_bin,
                     "run",
@@ -575,27 +757,34 @@ class OpenCodeOrchestrator:
                 # 统计信息，用于超时诊断
                 io_stats = {"last_output_time": time.time(), "total_bytes": 0, "last_label": ""}
 
-                async def _read_stream(stream, chunks: list[str], label: str, fh):
-                    """实时读取 nga 输出，过滤 ANSI 后写入 log 文件"""
+                async def _read_stream(stream, chunks: list[str], label: str, fh, slot_id: Optional[int] = None):
+                    """实时读取 nga 输出：
+                    - 过滤 ANSI 后写入 log 文件（保留原有行为）
+                    - 推送原始内容（含 ANSI）到 web debug 界面（debug 模式）
+                    """
                     while True:
                         data = await stream.read(4096)
                         if not data:
                             break
-                        text = data.decode("utf-8", errors="replace")
-                        text = ANSI_ESCAPE.sub("", text)
-                        chunks.append(text)
-                        fh.write(text)
+                        raw_text = data.decode("utf-8", errors="replace")
+                        # 推送原始内容到 web（保留 ANSI，让前端 ansi_up 渲染）
+                        if slot_id is not None:
+                            await self._web_push(slot_id, label, raw_text)
+                        # 过滤 ANSI 后用于 log 文件和后续报告
+                        clean_text = ANSI_ESCAPE.sub("", raw_text)
+                        chunks.append(clean_text)
+                        fh.write(clean_text)
                         fh.flush()
                         io_stats["last_output_time"] = time.time()
-                        io_stats["total_bytes"] += len(text)
+                        io_stats["total_bytes"] += len(clean_text)
                         io_stats["last_label"] = label
 
-                # 启动后台读取任务
+                # 启动后台读取任务（传入 slot_id 用于 web 推送）
                 stdout_task = asyncio.create_task(
-                    _read_stream(proc.stdout, stdout_chunks, "OUT", log_fh)
+                    _read_stream(proc.stdout, stdout_chunks, "stdout", log_fh, slot_id)
                 )
                 stderr_task = asyncio.create_task(
-                    _read_stream(proc.stderr, stderr_chunks, "ERR", log_fh)
+                    _read_stream(proc.stderr, stderr_chunks, "stderr", log_fh, slot_id)
                 )
 
                 # 3. 等待 nga 进程结束（软超时 SIGTERM + 硬超时 SIGKILL）
@@ -689,6 +878,10 @@ class OpenCodeOrchestrator:
 
                 tracker.complete_task(success=(task.status == "done"))
 
+                # 通知 web server 任务状态变更
+                if slot_id is not None:
+                    await self._web_status(slot_id, task.status, task.duration)
+
             except Exception as e:
                 task.status = "failed"
                 task.end_time = time.time()
@@ -704,6 +897,18 @@ class OpenCodeOrchestrator:
                 except Exception:
                     pass
                 tracker.complete_task(success=False)
+
+                # 通知 web server 异常状态
+                if slot_id is not None:
+                    await self._web_status(slot_id, "failed", 0.0)
+
+            finally:
+                # 释放 web 槽位（无论成功/失败/异常）
+                if slot_id is not None:
+                    await self._web_release(slot_id)
+                    if self.slot_manager is not None:
+                        await self.slot_manager.release(slot_id)
+                    logger.info(f"[{task.task_id}] Released web slot #{slot_id}")
 
         # 在 semaphore 块外执行清理，不占用并发槽位
         if self._cleanup_available:
@@ -751,6 +956,9 @@ def main():
 
   # 调整会话总超时
   python orchestrator.py --diff abc123 --timeout 600
+
+  # 启动 Web 调试界面（实时显示 NGA 输出）
+  python orchestrator.py --diff abc123 --repo . --debug --web-port 8080
         """,
     )
 
@@ -794,6 +1002,17 @@ def main():
         default=600,
         help="单个 nga session 的总超时时间(秒)（默认: 600）",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="启动 Web 调试界面，实时显示 NGA 进程输出（默认关闭）",
+    )
+    parser.add_argument(
+        "--web-port",
+        type=int,
+        default=8080,
+        help="Web 调试界面端口（默认: 8080）",
+    )
 
     args = parser.parse_args()
 
@@ -802,6 +1021,8 @@ def main():
         concurrency=args.concurrency,
         nga_bin=args.nga,
         session_timeout=args.timeout,
+        debug=args.debug,
+        web_port=args.web_port,
     )
 
     # 解析 cared_paths
