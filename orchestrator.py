@@ -518,6 +518,75 @@ class OpenCodeOrchestrator:
         )
         return message
 
+    async def _cleanup_nga_locks(self, task_id: str):
+        """执行 ngaent --cleanup-concurrency 清理残留锁"""
+        if not self._cleanup_available:
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ngaent",
+                "--cleanup-concurrency",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=5)
+            logger.debug(f"[{task_id}] Cleanup done")
+        except Exception as e:
+            logger.debug(f"[{task_id}] Cleanup skipped: {e}")
+
+    async def _cleanup_children(self, pid: int):
+        """尝试清理指定进程的子进程（递归 kill，兼容无 pstree 的环境）"""
+        try:
+            list_proc = await asyncio.create_subprocess_exec(
+                "sh", "-c",
+                f"get_children() {{ ps -o pid= --ppid $1 2>/dev/null; }}; "
+                f"for c1 in $(get_children {pid}); do "
+                f"  echo $c1; "
+                f"  for c2 in $(get_children $c1); do echo $c2; done; "
+                f"done | sort -u",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(list_proc.communicate(), timeout=2)
+            children = [p.strip() for p in stdout.decode().strip().split("\n") if p.strip()]
+            if children:
+                logger.debug(f"Killing children of pid={pid}: {children}")
+                kill_proc = await asyncio.create_subprocess_exec(
+                    "kill", "-9", *children,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(kill_proc.wait(), timeout=2)
+        except Exception:
+            pass
+
+    async def _wait_for_nga_slot(self, task_id: str):
+        """通过 pgrep 检查系统中的 nga 进程数，超过限制则短暂等待
+
+        这用于兜底：即使 Semaphore 释放了，如果 nga 进程（或其 daemon 子进程）
+        还在系统中运行，我们等它消失后再启动新的，避免被 nga 的并发拦截。
+        """
+        try:
+            for attempt in range(20):  # 最多等 10 秒
+                proc = await asyncio.create_subprocess_exec(
+                    "pgrep", "-x", "nga",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+                count = len([p for p in stdout.decode().strip().split("\n") if p.strip()])
+                if count < self.concurrency:
+                    if attempt > 0:
+                        logger.info(f"[{task_id}] NGA slot ready after wait (count={count})")
+                    break
+                logger.debug(
+                    f"[{task_id}] NGA slot full (count={count}, max={self.concurrency}), "
+                    f"waiting... ({attempt + 1}/20)"
+                )
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.debug(f"[{task_id}] NGA slot check skipped: {e}")
+
     async def _scan_one(self, task: ScanTask, tracker: ProgressTracker):
         """扫描单个文件"""
         async with self.semaphore:
@@ -526,6 +595,11 @@ class OpenCodeOrchestrator:
                     f"[{task.task_id}] {task.file_path} | Skipped (shutdown)"
                 )
                 return
+
+            # 启动前清理：处理上一个任务可能残留的锁/进程
+            await self._cleanup_nga_locks(task.task_id)
+            # 额外兜底：如果系统里还有 >=3 个 nga 进程，等它们退出
+            await self._wait_for_nga_slot(task.task_id)
 
             task.status = "running"
             task.start_time = time.time()
@@ -648,6 +722,8 @@ class OpenCodeOrchestrator:
                         )
                         proc.kill()
                         await proc.wait()
+                        # 清理可能残留的子进程，避免它们变成孤儿进程占用 nga 并发
+                        await self._cleanup_children(proc.pid)
                         task.returncode = -1
                         task.error = diag
 
@@ -696,6 +772,24 @@ class OpenCodeOrchestrator:
                 logger.error(
                     f"[{task.task_id}] {task.file_path} | EXCEPTION: {e}"
                 )
+                # 异常退出时，nga 子进程可能还在运行，必须强制终止
+                if "proc" in locals() and proc is not None and proc.returncode is None:
+                    logger.warning(
+                        f"[{task.task_id}] Killing leaked nga process "
+                        f"(pid={proc.pid}) due to exception"
+                    )
+                    try:
+                        proc.kill()
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    except Exception:
+                        pass
+                    # 尝试清理子进程
+                    await self._cleanup_children(proc.pid)
+                # 确保读取任务也被取消，避免挂起导致 Semaphore 不释放
+                if "stdout_task" in locals() and stdout_task is not None:
+                    stdout_task.cancel()
+                if "stderr_task" in locals() and stderr_task is not None:
+                    stderr_task.cancel()
                 # 确保 log 文件被关闭，并追加异常信息
                 try:
                     if "log_fh" in locals() and log_fh is not None and not log_fh.closed:
@@ -705,19 +799,8 @@ class OpenCodeOrchestrator:
                     pass
                 tracker.complete_task(success=False)
 
-        # 在 semaphore 块外执行清理，不占用并发槽位
-        if self._cleanup_available:
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "ngaent",
-                    "--cleanup-concurrency",
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await asyncio.wait_for(proc.wait(), timeout=5)
-                logger.debug(f"[{task.task_id}] Cleanup done")
-            except Exception as e:
-                logger.debug(f"[{task.task_id}] Cleanup skipped: {e}")
+        # 任务完成后执行清理（兜底：清理本任务可能残留的锁）
+        await self._cleanup_nga_locks(task.task_id)
 
     def _save_summary(self, total_time: float):
         """保存 Markdown 汇总报告"""
