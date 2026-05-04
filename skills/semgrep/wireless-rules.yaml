@@ -1,0 +1,148 @@
+rules:
+  # RULE-002: Struct cast memory safety - memcpy without sizeof check
+  - id: rule-002-memcpy-without-sizeof
+    patterns:
+      - pattern-either:
+          - pattern: |
+              memcpy($DST, $SRC, sizeof($TYPE));
+          - pattern: |
+              memcpy($DST, $SRC, $LEN);
+      - pattern-not: |
+          if (sizeof($TYPE) <= $MAX) { ... }
+      - pattern-not: |
+          if ($LEN <= sizeof($TYPE)) { ... }
+      - pattern-not: |
+          if ($LEN <= $MAX && ...) { ... }
+    message: |
+      [RULE-002] memcpy may copy more data than the destination can hold.
+      Ensure the length is validated against sizeof(destination) before calling memcpy.
+    languages: [c, cpp]
+    severity: ERROR
+    metadata:
+      rule_id: RULE-002
+      confidence: high
+
+  # RULE-003: Switch-Case missing safe default
+  - id: rule-003-switch-no-default
+    pattern: |
+      switch ($EXPR) {
+        case $C1:
+          ...
+        case $C2:
+          ...
+      }
+    pattern-not: |
+      switch ($EXPR) {
+        ...
+        default:
+          ...
+      }
+    message: |
+      [RULE-003] switch statement missing default branch.
+      Add a defensive default that safely discards or reports unhandled cases.
+    languages: [c, cpp]
+    severity: WARNING
+    metadata:
+      rule_id: RULE-003
+      confidence: high
+
+  # RULE-007: Uninitialized variable usage
+  - id: rule-007-uninitialized-variable
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $TYPE $VAR;
+              ...
+              $FUNC(..., $VAR, ...);
+          - pattern: |
+              $TYPE $VAR;
+              ...
+              return $VAR;
+          - pattern: |
+              $TYPE $VAR;
+              ...
+              if ($VAR) { ... }
+      - pattern-not-inside: |
+          $TYPE $VAR = ...;
+      - pattern-not-inside: |
+          $TYPE $VAR;
+          ...
+          $VAR = ...;
+    message: |
+      [RULE-007] Variable may be used before initialization.
+      Ensure all local variables and struct fields are initialized before use.
+    languages: [c, cpp]
+    severity: ERROR
+    metadata:
+      rule_id: RULE-007
+      confidence: medium
+
+  # RULE-009: Null pointer dereference
+  - id: rule-009-null-deref
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $PTR->$FIELD;
+          - pattern: |
+              $PTR[$IDX];
+          - pattern: |
+              *$PTR;
+      - pattern-not-inside: |
+          if ($PTR != NULL) { ... }
+      - pattern-not-inside: |
+          if ($PTR) { ... }
+      - metavariable-regex:
+          metavariable: $PTR
+          regex: "^(?!.*NULL).*$"
+    message: |
+      [RULE-009] Potential null pointer dereference.
+      Add a NULL check before dereferencing the pointer.
+    languages: [c, cpp]
+    severity: ERROR
+    metadata:
+      rule_id: RULE-009
+      confidence: medium
+
+  # RULE-010: Array index without bounds check
+  - id: rule-010-array-index-unbounded
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $ARRAY[$IDX] = ...;
+          - pattern: |
+              ... = $ARRAY[$IDX];
+      - pattern-not-inside: |
+          if ($IDX < $SIZE) { ... }
+      - pattern-not-inside: |
+          if ($IDX >= 0 && $IDX < $SIZE) { ... }
+      - pattern-not-inside: |
+          for (int $I = 0; $I < $SIZE; ...) { ... $ARRAY[$I] ... }
+    message: |
+      [RULE-010] Array index used without bounds check.
+      Validate the index against array size before access.
+    languages: [c, cpp]
+    severity: ERROR
+    metadata:
+      rule_id: RULE-010
+      confidence: medium
+
+  # RULE-024: Unsafe function usage (subset of known unsafe functions)
+  - id: rule-024-unsafe-function
+    pattern-either:
+      - pattern: strcpy(...)
+      - pattern: strcat(...)
+      - pattern: sprintf(...)
+      - pattern: gets(...)
+      - pattern: wcscpy(...)
+      - pattern: wcscat(...)
+    message: |
+      [RULE-024] Unsafe function detected. Replace with bounded alternatives:
+      - strcpy → strncpy or strlcpy
+      - strcat → strncat or strlcat
+      - sprintf → snprintf
+      - gets → fgets (or remove entirely)
+    languages: [c, cpp]
+    severity: ERROR
+    metadata:
+      rule_id: RULE-024
+      confidence: high
