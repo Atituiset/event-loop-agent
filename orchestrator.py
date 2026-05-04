@@ -120,9 +120,9 @@ class ScanTask:
     returncode: Optional[int] = None
     diff_content: str = ""   # diff 模式: 该文件的 diff 内容
     diff_file: str = ""      # diff 模式: diff 内容保存的文件路径
-    slot_id: Optional[int] = None  # debug 模式下分配的 web 终端槽位
-    sast_issues: list = None      # Phase 1: SAST 预扫描发现的问题
-    impacted_files: list = None   # Phase 2: 影响面分析识别的关联文件
+    slot_id: Optional[int] = None          # debug 模式下分配的 web 终端槽位
+    sast_issues: Optional[list] = None     # Phase 1: SAST 预扫描发现的问题
+    impacted_files: Optional[list] = None  # Phase 2: 影响面分析识别的关联文件
 
     @property
     def duration(self) -> float:
