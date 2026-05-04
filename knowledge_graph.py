@@ -96,6 +96,44 @@ class KnowledgeGraph:
         self._conn: Optional[sqlite3.Connection] = None
         self._init_db()
 
+    # ------------------------------------------------------------------
+    #  Phase 3: Lightweight embedding (keyword-based similarity)
+    # ------------------------------------------------------------------
+
+    _STOP_WORDS: set[str] = {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "must", "shall", "can", "need", "dare",
+        "ought", "used", "to", "of", "in", "for", "on", "with", "at", "by",
+        "from", "as", "into", "through", "during", "before", "after",
+        "above", "below", "between", "under", "again", "further", "then",
+        "once", "here", "there", "when", "where", "why", "how", "all",
+        "any", "both", "each", "few", "more", "most", "other", "some",
+        "such", "no", "nor", "not", "only", "own", "same", "so", "than",
+        "too", "very", "just", "and", "but", "if", "or", "because", "until",
+        "while", "这", "那", "的", "了", "在", "是", "我", "有", "和",
+        "就", "不", "人", "都", "一", "一个", "上", "也", "很", "到",
+        "说", "要", "去", "你", "会", "着", "没有", "看", "好", "自己",
+        "这", "那", "为", "之", "与", "及", "等", "或", "但", "而",
+        "因", "于", "则", "即", "乃", "若", "虽", "故", "既", "以",
+    }
+
+    def _extract_keywords(self, text: str) -> set[str]:
+        """Extract keywords from text for similarity matching."""
+        # Keep Chinese characters, English words, and technical terms
+        words = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{2,}|[一-鿿]{2,}", text.lower())
+        return {w for w in words if w not in self._STOP_WORDS and len(w) > 2}
+
+    def _text_similarity(self, text1: str, text2: str) -> float:
+        """Compute Jaccard similarity between two texts (0~1)."""
+        kw1 = self._extract_keywords(text1)
+        kw2 = self._extract_keywords(text2)
+        if not kw1 or not kw2:
+            return 0.0
+        intersection = kw1 & kw2
+        union = kw1 | kw2
+        return len(intersection) / len(union)
+
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None or self._conn.total_changes < 0:
             self._conn = sqlite3.connect(str(self.db_path))
@@ -452,7 +490,21 @@ class KnowledgeGraph:
                 if len(results) >= top_k:
                     break
 
-        # Strategy 3: Fallback to all high-confidence patterns
+        # Strategy 3: Embedding-based fuzzy matching (Phase 3)
+        if len(results) < top_k and code_snippet:
+            all_patterns = self.get_all_patterns()
+            scored = []
+            for p in all_patterns:
+                if p.confidence < min_confidence or p in results:
+                    continue
+                sim = self._text_similarity(code_snippet, p.content)
+                if sim > 0.1:  # Minimum similarity threshold
+                    scored.append((sim, p))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            for sim, p in scored[:top_k - len(results)]:
+                results.append(p)
+
+        # Strategy 4: Fallback to all high-confidence patterns
         if not results:
             rows = conn.execute(
                 "SELECT * FROM patterns WHERE confidence >= ? ORDER BY confidence DESC LIMIT ?",
