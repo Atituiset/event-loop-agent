@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Knowledge graph database (generated)
+.claude/knowledge.db
+.claude/*.db
+
+# Reports (generated)
+reports/
+
+# IDE
+.vscode/
+.idea/

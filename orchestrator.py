@@ -64,6 +64,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from knowledge_graph import KnowledgeGraph
+
 # Optional HTTP client for web debug interface (only used when --debug)
 try:
     import httpx
@@ -334,6 +336,10 @@ class OpenCodeOrchestrator:
             logger.debug("ngaent cleanup available")
         self.repo_path: Optional[Path] = None
         self.start_commit: Optional[str] = None
+
+        # Knowledge graph (Phase 0)
+        self.knowledge_graph = KnowledgeGraph(".claude/knowledge.db")
+        logger.info(f"Knowledge graph loaded: {self.knowledge_graph.stats()}")
 
         # debug 模式下的槽位管理和 web 服务器状态
         self.slot_manager: Optional[SlotManager] = None
@@ -667,25 +673,129 @@ class OpenCodeOrchestrator:
         total_time = sum(t.duration for t in self.tasks)
         self._save_summary(total_time)
 
+        # Phase 0: 记录扫描运行
+        issues_found = sum(
+            1 for t in self.tasks
+            if t.status == "done" and self.knowledge_graph.get_cases_by_file(t.file_path, limit=1)
+        )
+        self.knowledge_graph.record_scan_run(
+            run_id=self.output_dir.name,
+            total_files=len(self.tasks),
+            issues_found=issues_found,
+            duration=total_time,
+            commit_hash=self.start_commit or "",
+            branch="",
+        )
+
+        # 知识库统计
+        stats = self.knowledge_graph.stats()
+        logger.info(f"Knowledge graph stats: {stats}")
+
+        # 关闭知识库连接
+        self.knowledge_graph.close()
+
         # 扫描结束后关闭 web server
         if self.debug:
             await self._stop_web_server()
 
     def _build_diff_scan_cmd(self, task: ScanTask) -> str:
-        """Diff 模式下构造审查提示词，指引 nga 读取 diff 文件并审查"""
-        message = (
-            f"请审查文件 {task.file_path} 的代码变更。\n\n"
-            f"该文件的 diff 内容已保存到：{task.diff_file}\n"
-            f"请读取该 diff 文件，结合变更上下文进行审查。\n\n"
-            f"审查要求：\n"
-            f"1. 应用无线通信安全编码规则（RULE-001~RULE-010）对变更代码进行检查\n"
-            f"2. 如果变更在函数内部，请同时审查该函数的完整实现，包括："
-            f"函数内所有变量的定义和声明、该函数的调用者（caller）、该函数调用的其他函数（callee）\n"
-            f"3. 如果变更涉及全局变量、结构体声明、枚举声明等不在函数体内的代码，"
-            f"请找到该符号的所有使用点并一并审查\n"
-            f"4. 对每个发现的问题提供：文件路径、行号、问题描述、代码片段、修复建议、置信度"
+        """Diff 模式下构造审查提示词，注入知识上下文后指引 nga 审查"""
+        parts = []
+        parts.append(f"请审查文件 {task.file_path} 的代码变更。\n")
+
+        # 1. 知识上下文：从 Knowledge Graph 匹配相关 Pattern
+        relevant = self.knowledge_graph.find_relevant_patterns(
+            task.file_path, task.diff_content, top_k=5
         )
-        return message
+        if relevant:
+            parts.append("## 已知风险模式（请重点检查）\n")
+            for p in relevant:
+                rule_hint = f"[{p.rule_id}] " if p.rule_id else ""
+                parts.append(f"- {rule_hint}{p.content}\n")
+            parts.append("\n")
+
+        # 2. 文件风险画像
+        profile = self.knowledge_graph.get_file_profile(task.file_path)
+        if profile and profile.total_issues > 0:
+            parts.append("## 文件风险画像\n")
+            parts.append(f"该文件历史发现 {profile.total_issues} 个问题，"
+                        f"风险评分: {profile.risk_score:.1f}/10\n")
+            if profile.top_patterns:
+                parts.append(f"常见模式: {', '.join(profile.top_patterns[:3])}\n")
+            parts.append("\n")
+
+        # 3. 上次扫描遗留问题
+        last_issues = self.knowledge_graph.get_last_scan_issues(task.file_path)
+        if last_issues:
+            parts.append("## 上次扫描遗留问题（请确认是否已修复）\n")
+            for issue in last_issues:
+                parts.append(f"- [{issue.rule_id}] {issue.message}")
+                if issue.line_number > 0:
+                    parts.append(f" (行 {issue.line_number})")
+                parts.append("\n")
+            parts.append("\n")
+
+        # 4. Diff 内容指引
+        if task.diff_file:
+            parts.append(f"该文件的 diff 内容已保存到：{task.diff_file}\n")
+            parts.append("请读取该 diff 文件，结合变更上下文进行审查。\n\n")
+
+        # 5. 审查要求（现有）
+        parts.append("## 审查要求\n")
+        parts.append("1. 应用无线通信安全编码规则（RULE-001~RULE-010）对变更代码进行检查\n")
+        parts.append("2. 如果变更在函数内部，请同时审查该函数的完整实现，包括：")
+        parts.append("函数内所有变量的定义和声明、该函数的调用者（caller）、该函数调用的其他函数（callee）\n")
+        parts.append("3. 如果变更涉及全局变量、结构体声明、枚举声明等不在函数体内的代码，")
+        parts.append("请找到该符号的所有使用点并一并审查\n")
+        parts.append("4. 对每个发现的问题提供：文件路径、行号、问题描述、代码片段、修复建议、置信度\n")
+        parts.append("5. 如果上次扫描遗留问题仍未修复，请在报告中明确指出\n")
+        parts.append("6. 输出格式要求：对每个问题使用 [RULE-XXX] 标记，方便后续自动提取\n")
+
+        return "".join(parts)
+
+    def _extract_findings(self, task: ScanTask) -> int:
+        """从 nga stdout 中提取 RULE-XXX 标记的问题，存入知识图谱。"""
+        if not task.stdout:
+            return 0
+
+        count = 0
+        rule_pattern = re.compile(r'\[?RULE-(\d{3})\]?', re.IGNORECASE)
+
+        # Simple extraction: find RULE-XXX mentions and the surrounding paragraph
+        paragraphs = task.stdout.split('\n\n')
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+            m = rule_pattern.search(para)
+            if m:
+                rule_id = f"RULE-{m.group(1)}"
+                # Extract a one-line summary (first sentence or first 200 chars)
+                summary = para.replace('\n', ' ').strip()
+                if len(summary) > 300:
+                    # Try to find first sentence
+                    sentence_end = summary.find('。')
+                    if sentence_end == -1:
+                        sentence_end = summary.find('.')
+                    if sentence_end > 10:
+                        summary = summary[:sentence_end + 1]
+                    else:
+                        summary = summary[:300] + "..."
+
+                self.knowledge_graph.add_case(
+                    file_path=task.file_path,
+                    line_number=0,
+                    rule_id=rule_id,
+                    message=summary,
+                    code_snippet="",
+                    confidence=0.7,
+                    scan_id=task.task_id,
+                )
+                count += 1
+
+        if count > 0:
+            logger.info(f"[{task.task_id}] Extracted {count} findings into knowledge graph")
+        return count
 
     async def _cleanup_nga_locks(self, task_id: str):
         """执行 ngaent --cleanup-concurrency 清理残留锁"""
@@ -954,6 +1064,13 @@ class OpenCodeOrchestrator:
                 logger.debug(f"[{task.task_id}] Log saved: {task.log_file}")
 
                 tracker.complete_task(success=(task.status == "done"))
+
+                # Phase 0: 知识提取与文件画像更新
+                if task.status == "done":
+                    extracted = self._extract_findings(task)
+                    self.knowledge_graph.update_file_profile(
+                        task.file_path, new_issues=extracted
+                    )
 
                 # 通知 web server 任务状态变更
                 if slot_id is not None:
