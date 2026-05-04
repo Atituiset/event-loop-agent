@@ -176,51 +176,57 @@ class SemgrepTool(BaseSASTTool):
         if not self._config_file.exists():
             return {}
 
-        try:
-            result = subprocess.run(
-                [
-                    "semgrep",
-                    "--config", str(self._config_file),
-                    "--json",
-                    "--quiet",
-                ] + file_paths,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            data = json.loads(result.stdout)
-            # Group by file path
-            results: dict[str, list[SASTIssue]] = {fp: [] for fp in file_paths}
-            for r in data.get("results", []):
-                fp = r.get("path", "")
-                if fp not in results:
-                    results[fp] = []
-                meta = r.get("extra", {}).get("metadata", {})
-                rule_id = meta.get("rule_id", r.get("check_id", "UNKNOWN"))
-                severity = r.get("extra", {}).get("severity", "WARNING")
-                severity_map = {"ERROR": "HIGH", "WARNING": "MEDIUM", "INFO": "LOW"}
-                confidence = meta.get("confidence", 0.8)
-                if isinstance(confidence, str):
-                    confidence = {"high": 0.9, "medium": 0.7, "low": 0.5}.get(confidence, 0.7)
+        BATCH_SIZE = 100  # Avoid command-line length issues
+        all_results: dict[str, list[SASTIssue]] = {fp: [] for fp in file_paths}
 
-                issue = SASTIssue(
-                    tool="semgrep",
-                    rule_id=rule_id,
-                    severity=severity_map.get(severity, "MEDIUM"),
-                    file_path=fp,
-                    line_number=r.get("start", {}).get("line", 0),
-                    column=r.get("start", {}).get("col", 0),
-                    message=r.get("extra", {}).get("message", ""),
-                    code_snippet=r.get("extra", {}).get("lines", "").strip(),
-                    confidence=confidence,
-                    metadata=meta,
+        for i in range(0, len(file_paths), BATCH_SIZE):
+            batch = file_paths[i:i + BATCH_SIZE]
+            try:
+                result = subprocess.run(
+                    [
+                        "semgrep",
+                        "--config", str(self._config_file),
+                        "--json",
+                        "--quiet",
+                    ] + batch,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
                 )
-                results[fp].append(issue)
-            return results
+                data = json.loads(result.stdout)
+                for r in data.get("results", []):
+                    fp = r.get("path", "")
+                    if fp not in all_results:
+                        all_results[fp] = []
+                    meta = r.get("extra", {}).get("metadata", {})
+                    rule_id = meta.get("rule_id", r.get("check_id", "UNKNOWN"))
+                    severity = r.get("extra", {}).get("severity", "WARNING")
+                    severity_map = {"ERROR": "HIGH", "WARNING": "MEDIUM", "INFO": "LOW"}
+                    confidence = meta.get("confidence", 0.8)
+                    if isinstance(confidence, str):
+                        confidence = {"high": 0.9, "medium": 0.7, "low": 0.5}.get(confidence, 0.7)
 
-        except Exception as e:
-            logger.warning(f"semgrep batch scan failed: {e}")
-            return {}
+                    issue = SASTIssue(
+                        tool="semgrep",
+                        rule_id=rule_id,
+                        severity=severity_map.get(severity, "MEDIUM"),
+                        file_path=fp,
+                        line_number=r.get("start", {}).get("line", 0),
+                        column=r.get("start", {}).get("col", 0),
+                        message=r.get("extra", {}).get("message", ""),
+                        code_snippet=r.get("extra", {}).get("lines", "").strip(),
+                        confidence=confidence,
+                        metadata=meta,
+                    )
+                    all_results[fp].append(issue)
+            except Exception as e:
+                logger.warning(f"semgrep batch scan failed for batch {i//BATCH_SIZE + 1}: {e}")
+                # Fallback to individual scans for this batch
+                for fp in batch:
+                    issues = self.scan(fp)
+                    all_results[fp] = issues
+
+        return all_results
 
 
 # ============================================================================
