@@ -192,31 +192,17 @@ class ImpactAnalyzer:
             impacted.extend(self._find_includers(path.name))
             reason = f"header file change: {len(impacted)} files include it"
 
-        # Symbol-based impact
-        if symbols["struct"]:
-            refs = self._find_symbol_references(symbols["struct"])
-            impacted.extend(refs)
-            reason += f"; struct references: {len(refs)} files"
+        # Symbol-based impact (batch search for efficiency)
+        all_symbols = []
+        for cat in ["struct", "enum", "macro", "function", "global_var"]:
+            all_symbols.extend(symbols[cat])
 
-        if symbols["enum"]:
-            refs = self._find_symbol_references(symbols["enum"])
+        if all_symbols:
+            refs = self._find_symbol_references_batch(all_symbols)
             impacted.extend(refs)
-            reason += f"; enum references: {len(refs)} files"
+            reason += f"; symbol references: {len(refs)} files"
 
-        if symbols["macro"]:
-            refs = self._find_symbol_references(symbols["macro"])
-            impacted.extend(refs)
-            reason += f"; macro references: {len(refs)} files"
-
-        if symbols["function"]:
-            refs = self._find_symbol_references(symbols["function"])
-            impacted.extend(refs)
-            reason += f"; function references: {len(refs)} files"
-
-        if symbols["global_var"]:
-            refs = self._find_symbol_references(symbols["global_var"])
-            impacted.extend(refs)
-            reason += f"; global var references: {len(refs)} files"
+        # Note: Per-category breakdown available in changed_symbols field
 
         # Deduplicate and exclude self
         impacted = sorted(set(f for f in impacted if f != file_path))
@@ -260,27 +246,44 @@ class ImpactAnalyzer:
 
     def _find_symbol_references(self, symbols: list[str]) -> list[str]:
         """Find all files that reference any of the given symbols."""
+        return self._find_symbol_references_batch(symbols)
+
+    def _find_symbol_references_batch(self, symbols: list[str]) -> list[str]:
+        """
+        Batch search: find all files that reference any of the given symbols.
+        More efficient than individual searches for large symbol sets.
+        """
         if not symbols:
             return []
 
+        # Build combined regex pattern
+        # Limit to avoid command-line length issues
+        if len(symbols) > 50:
+            symbols = symbols[:50]
+
+        pattern = "|".join(re.escape(s) for s in symbols)
         files: set[str] = set()
-        for sym in symbols:
-            try:
-                result = subprocess.run(
-                    ["grep", "-rl", "--include=*.c", "--include=*.cc",
-                     "--include=*.cpp", "--include=*.h", "--include=*.hpp",
-                     f"\\b{re.escape(sym)}\\b", str(self.repo_path)],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-                for line in result.stdout.strip().split("\n"):
-                    line = line.strip()
-                    if line:
+
+        try:
+            result = subprocess.run(
+                ["grep", "-rl", "--include=*.c", "--include=*.cc",
+                 "--include=*.cpp", "--include=*.h", "--include=*.hpp",
+                 f"\\b({pattern})\\b", str(self.repo_path)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            for line in result.stdout.strip().split("\n"):
+                line = line.strip()
+                if line:
+                    try:
                         rel = Path(line).relative_to(self.repo_path)
                         files.add(str(rel))
-            except Exception as e:
-                logger.debug(f"find_symbol_references failed for {sym}: {e}")
+                    except ValueError:
+                        # Path not under repo_path, skip
+                        pass
+        except Exception as e:
+            logger.debug(f"find_symbol_references_batch failed: {e}")
 
         return sorted(files)
 
