@@ -1,5 +1,12 @@
+# Core dependencies (required)
 fastapi>=0.100.0
 uvicorn>=0.23.0
 gunicorn>=21.0.0
 httpx>=0.24.0
 starlette>=0.27.0
+
+# Optional: Phase 1 - Local SAST engine
+# semgrep>=1.50.0
+
+# Optional: Phase 3 - High-quality embeddings
+# sentence-transformers>=2.2.0
