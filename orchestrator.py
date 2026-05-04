@@ -66,6 +66,7 @@ from typing import Optional
 
 from knowledge_graph import KnowledgeGraph
 from sast_engine import SASTEngine, RouteDecision, format_sast_issue_markdown
+from impact_analyzer import ImpactAnalyzer, format_impact_summary
 
 # Optional HTTP client for web debug interface (only used when --debug)
 try:
@@ -115,7 +116,8 @@ class ScanTask:
     diff_content: str = ""   # diff 模式: 该文件的 diff 内容
     diff_file: str = ""      # diff 模式: diff 内容保存的文件路径
     slot_id: Optional[int] = None  # debug 模式下分配的 web 终端槽位
-    sast_issues: list = None  # Phase 1: SAST 预扫描发现的问题
+    sast_issues: list = None      # Phase 1: SAST 预扫描发现的问题
+    impacted_files: list = None   # Phase 2: 影响面分析识别的关联文件
 
     @property
     def duration(self) -> float:
@@ -574,18 +576,36 @@ class OpenCodeOrchestrator:
             changed_files = self._filter_by_cared_paths(changed_files, cared_paths)
             logger.info(f"After cared_paths filter: {len(changed_files)} files")
 
-        for i, fp in enumerate(changed_files, 1):
+        # Phase 2: Impact analysis - expand scan queue with affected files
+        impact_analyzer = ImpactAnalyzer(repo_path=repo)
+        expanded_files, context_map = impact_analyzer.expand_scan_tasks(changed_files)
+        if len(expanded_files) > len(changed_files):
+            logger.info(
+                f"Impact analysis expanded: {len(changed_files)} -> "
+                f"{len(expanded_files)} files"
+            )
+
+        for i, fp in enumerate(expanded_files, 1):
             report_file, log_file = self._get_output_paths(fp, cared_paths)
 
-            # 提取该文件的 diff 内容
-            diff_content = self._get_file_diff(repo, start_commit, fp)
+            # 提取该文件的 diff 内容 (仅原始变更文件有 diff)
+            diff_content = ""
             diff_file = ""
-            if diff_content:
-                diff_path = self.diff_dir / Path(fp).parent / f"{Path(fp).stem}.diff"
-                diff_path.parent.mkdir(parents=True, exist_ok=True)
-                diff_path.write_text(diff_content, encoding="utf-8")
-                diff_file = str(diff_path)
-                logger.debug(f"[{i:03d}] Diff saved: {diff_path}")
+            if fp in changed_files:
+                diff_content = self._get_file_diff(repo, start_commit, fp)
+                if diff_content:
+                    diff_path = self.diff_dir / Path(fp).parent / f"{Path(fp).stem}.diff"
+                    diff_path.parent.mkdir(parents=True, exist_ok=True)
+                    diff_path.write_text(diff_content, encoding="utf-8")
+                    diff_file = str(diff_path)
+                    logger.debug(f"[{i:03d}] Diff saved: {diff_path}")
+
+            # 获取影响面上下文
+            impacted = []
+            for primary, ctx_files in context_map.items():
+                if fp == primary or fp in ctx_files:
+                    impacted = ctx_files
+                    break
 
             self.tasks.append(ScanTask(
                 file_path=fp,
@@ -594,6 +614,7 @@ class OpenCodeOrchestrator:
                 log_file=str(log_file),
                 diff_content=diff_content,
                 diff_file=diff_file,
+                impacted_files=impacted,
             ))
 
     def _get_changed_files(self, repo: Path, start_commit: str) -> list[str]:
@@ -776,6 +797,16 @@ class OpenCodeOrchestrator:
                 for issue in llm_issues:
                     parts.append(f"- [{issue.rule_id}] 行 {issue.line_number}: {issue.message}\n")
                 parts.append("\n")
+
+        # 3.6 影响面上下文（Phase 2）
+        if task.impacted_files:
+            parts.append("## 影响范围\n")
+            parts.append("本次变更可能影响以下文件，请一并审查相关逻辑：\n")
+            for f in task.impacted_files[:10]:
+                parts.append(f"- `{f}`\n")
+            if len(task.impacted_files) > 10:
+                parts.append(f"- ... 等共 {len(task.impacted_files)} 个文件\n")
+            parts.append("\n")
 
         # 4. Diff 内容指引
         if task.diff_file:
