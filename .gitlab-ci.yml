@@ -1,0 +1,26 @@
+# OpenCode Agent - GitLab CI Integration
+# Scan C/C++ code changes on every MR
+
+code_scan:
+  stage: test
+  image: python:3.11-slim
+  before_script:
+    - pip install -r requirements.txt
+    # Optional: install SAST tools for Phase 1
+    # - pip install semgrep
+    # - apt-get update && apt-get install -y cppcheck
+  script:
+    - python orchestrator.py
+        --diff "$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+        --repo .
+        --timeout 600
+        -c 3
+  artifacts:
+    paths:
+      - reports/
+    reports:
+      sast: reports/*/scan-results.sarif
+    expire_in: 30 days
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+  allow_failure: false

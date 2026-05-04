@@ -1,0 +1,53 @@
+name: C/C++ Security Scan
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          # Optional: install SAST tools for Phase 1
+          # pip install semgrep
+          # sudo apt-get update && sudo apt-get install -y cppcheck
+
+      - name: Get base commit
+        id: base
+        run: echo "sha=$(git merge-base HEAD ${{ github.event.pull_request.base.sha || 'HEAD~1' }})" >> $GITHUB_OUTPUT
+
+      - name: Run C/C++ scan
+        run: |
+          python orchestrator.py \
+            --diff ${{ steps.base.outputs.sha }} \
+            --repo . \
+            --timeout 600 \
+            -c 3
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: reports/*/scan-results.sarif
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-reports
+          path: reports/
+          retention-days: 30
