@@ -67,6 +67,11 @@ from typing import Optional
 from knowledge_graph import KnowledgeGraph
 from sast_engine import SASTEngine, RouteDecision, format_sast_issue_markdown
 from impact_analyzer import ImpactAnalyzer, format_impact_summary
+from output_formats import (
+    write_sarif_file,
+    write_json_file,
+    DEFAULT_RULES_METADATA,
+)
 
 # Optional HTTP client for web debug interface (only used when --debug)
 try:
@@ -740,6 +745,28 @@ class OpenCodeOrchestrator:
             commit_hash=self.start_commit or "",
             branch="",
         )
+
+        # Phase 4: 生成结构化输出
+        try:
+            sarif_path = self.output_dir / "scan-results.sarif"
+            write_sarif_file(
+                self.tasks,
+                sarif_path,
+                run_id=self.output_dir.name,
+                commit_hash=self.start_commit or "",
+            )
+            logger.info(f"SARIF report: {sarif_path}")
+
+            json_path = self.output_dir / "scan-results.json"
+            write_json_file(
+                self.tasks,
+                json_path,
+                run_id=self.output_dir.name,
+                duration=total_time,
+            )
+            logger.info(f"JSON report: {json_path}")
+        except Exception as e:
+            logger.warning(f"Failed to generate structured output: {e}")
 
         # 知识库统计
         stats = self.knowledge_graph.stats()
