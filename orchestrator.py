@@ -844,14 +844,12 @@ class OpenCodeOrchestrator:
                 logger.debug(f"[{task.task_id}] Command: nga run '{message[:200]}...'")
 
                 # 2. 启动 nga 子进程
-                # debug 模式下使用 TERM=xterm-256color 保留 ANSI 输出（捕获思考过程）
-                # 非 debug 模式下使用 TERM=dumb 过滤 ANSI
+                # 继承当前终端的 TERM，让 nga 正常输出
+                # ANSI 转义序列由 _read_stream 中的 ANSI_ESCAPE 正则兜底过滤
                 env = os.environ.copy()
-                if self.debug:
-                    env["TERM"] = "xterm-256color"
-                else:
-                    env["TERM"] = "dumb"
                 proc = await asyncio.create_subprocess_exec(
+                    "stdbuf",
+                    "-oL",
                     self.nga_bin,
                     "run",
                     message,
