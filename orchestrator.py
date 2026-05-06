@@ -935,7 +935,21 @@ class OpenCodeOrchestrator:
                         task.error = diag
 
                 # 等待读取任务完成（进程结束后 pipe 会 EOF，读取任务自然退出）
-                await asyncio.gather(stdout_task, stderr_task)
+                # shutdown 时主动取消，防止 nga 的孙子进程持有 pipe fd 导致挂起
+                read_tasks = [stdout_task, stderr_task]
+                while any(not t.done() for t in read_tasks):
+                    if self._shutdown:
+                        for t in read_tasks:
+                            t.cancel()
+                        break
+                    await asyncio.sleep(0.1)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*read_tasks, return_exceptions=True),
+                        timeout=5,
+                    )
+                except Exception:
+                    pass
 
                 task.end_time = time.time()
                 task.stdout = "".join(stdout_chunks)
