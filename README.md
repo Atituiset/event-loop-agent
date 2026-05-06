@@ -43,20 +43,32 @@
 
 ## 快速开始
 
+### 环境准备
+
+本项目使用 [uv](https://github.com/astral-sh/uv) 管理 Python 依赖：
+
+```bash
+# 安装依赖（首次）
+uv sync
+
+# 后续运行命令
+uv run python orchestrator.py ...
+```
+
 ### 模式一：Diff 模式
 
 扫描从指定 commit 到 HEAD 的所有变更文件：
 
 ```bash
 cd /path/to/your/app  # 进入代码仓
-python orchestrator.py --diff abc123 --repo . -c 3
+uv run python orchestrator.py --diff abc123 --repo . -c 3
 ```
 
 **只扫描指定目录下的变更文件**：
 
 ```bash
 # 只扫描 src/rr 和 src/mac 目录下的变更
-python orchestrator.py --diff abc123 --paths src/rr,src/mac --repo . -c 3
+uv run python orchestrator.py --diff abc123 --paths src/rr,src/mac --repo . -c 3
 ```
 
 **原理**：
@@ -74,10 +86,10 @@ python orchestrator.py --diff abc123 --paths src/rr,src/mac --repo . -c 3
 
 ```bash
 # 指定文件
-python orchestrator.py --files file1.c file2.c file3.c -c 3
+uv run python orchestrator.py --files file1.c file2.c file3.c -c 3
 
 # 指定目录（递归扫描目录及子目录下的所有 C/C++ 文件）
-python orchestrator.py --files app/a app/b -c 3
+uv run python orchestrator.py --files app/a app/b -c 3
 ```
 
 ### 终端输出示例

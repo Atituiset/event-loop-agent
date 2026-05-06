@@ -1,0 +1,13 @@
+[project]
+name = "event-loop-agent"
+version = "0.1.0"
+description = "OpenCode Agent - Event Loop parallel scanning orchestrator for C/C++ code review"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.100.0",
+    "gunicorn>=21.0.0",
+    "httpx>=0.24.0",
+    "starlette>=0.27.0",
+    "uvicorn>=0.23.0",
+]
