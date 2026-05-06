@@ -645,6 +645,11 @@ class OpenCodeOrchestrator:
             logger.warning("No tasks to run")
             return
 
+        # 注册信号处理器（必须在 asyncio.run 创建的循环上注册）
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda: setattr(self, "_shutdown", True))
+
         # debug 模式下启动 web server
         if self.debug:
             await self._start_web_server()
@@ -1124,11 +1129,6 @@ def main():
     if not orch.tasks:
         logger.error("No files to scan. Exiting.")
         sys.exit(1)
-
-    # 信号处理
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: setattr(orch, "_shutdown", True))
 
     asyncio.run(orch.run())
 
