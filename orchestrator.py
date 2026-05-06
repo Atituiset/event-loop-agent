@@ -182,8 +182,12 @@ def generate_report(task: ScanTask) -> str:
     lines.append("")
 
     if task.stdout.strip():
-        # 直接展示 nga 的审查结果，不加代码块包装
-        lines.append(task.stdout)
+        # 过滤思考过程（以 "Thinking:" 开头的行），只保留审查结果
+        review_lines = [
+            line for line in task.stdout.splitlines()
+            if not line.startswith("Thinking:")
+        ]
+        lines.append("\n".join(review_lines))
     else:
         lines.append("*无审查结果*")
 
@@ -317,12 +321,14 @@ class OpenCodeOrchestrator:
         session_timeout: int = 600,
         debug: bool = False,
         web_port: int = 8080,
+        thinking: bool = False,
     ):
         self.concurrency = concurrency
         self.nga_bin = nga_bin
         self.session_timeout = session_timeout
         self.debug = debug
         self.web_port = web_port
+        self.thinking = thinking
 
         self.tasks: list[ScanTask] = []
         self.semaphore = asyncio.Semaphore(concurrency)
@@ -839,10 +845,13 @@ class OpenCodeOrchestrator:
                 # 2. 启动 nga 子进程（TERM=dumb 抑制 ANSI 颜色码）
                 env = os.environ.copy()
                 env["TERM"] = "dumb"
+                cmd_args = [self.nga_bin, "run"]
+                if self.thinking:
+                    cmd_args.append("--thinking")
+                cmd_args.append(message)
                 proc = await asyncio.create_subprocess_exec(
-                    self.nga_bin,
-                    "run",
-                    message,
+                    *cmd_args,
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
@@ -1138,6 +1147,11 @@ def main():
         help="启动 Web 调试界面，实时显示 NGA 进程输出（默认关闭）",
     )
     parser.add_argument(
+        "--thinking",
+        action="store_true",
+        help="显示 opencode 的思考过程（通过 --thinking 标志）",
+    )
+    parser.add_argument(
         "--web-port",
         type=int,
         default=8080,
@@ -1153,6 +1167,7 @@ def main():
         session_timeout=args.timeout,
         debug=args.debug,
         web_port=args.web_port,
+        thinking=args.thinking,
     )
 
     # 解析 cared_paths
