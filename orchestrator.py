@@ -328,10 +328,10 @@ class OpenCodeOrchestrator:
         self.semaphore = asyncio.Semaphore(concurrency)
         self._shutdown = False
 
-        # 检查 ngaent 清理命令是否可用（用于清理 nga 残留的并发锁文件）
-        self._cleanup_available = shutil.which("ngaent") is not None
+        # 检查 nga 清理命令是否可用（用于清理 nga 残留的并发锁文件）
+        self._cleanup_available = shutil.which("nga") is not None
         if self._cleanup_available:
-            logger.debug("ngaent cleanup available")
+            logger.debug("nga cleanup available")
         self.repo_path: Optional[Path] = None
         self.start_commit: Optional[str] = None
 
@@ -688,12 +688,12 @@ class OpenCodeOrchestrator:
         return message
 
     async def _cleanup_nga_locks(self, task_id: str):
-        """执行 ngaent --cleanup-concurrency 清理残留锁"""
+        """执行 nga --cleanup-concurrency 清理残留锁"""
         if not self._cleanup_available:
             return
         try:
             proc = await asyncio.create_subprocess_exec(
-                "ngaent",
+                "nga",
                 "--cleanup-concurrency",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
