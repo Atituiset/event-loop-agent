@@ -327,6 +327,7 @@ class OpenCodeOrchestrator:
         self.tasks: list[ScanTask] = []
         self.semaphore = asyncio.Semaphore(concurrency)
         self._shutdown = False
+        self._active_procs: set[asyncio.subprocess.Process] = set()
 
         # 检查 nga 清理命令是否可用（用于清理 nga 残留的并发锁文件）
         self._cleanup_available = shutil.which("nga") is not None
@@ -639,6 +640,16 @@ class OpenCodeOrchestrator:
     #  主控循环
     # ------------------------------------------------------------------
 
+    def _on_signal(self):
+        """收到 SIGINT/SIGTERM 时：设置 shutdown 标志并 kill 所有活跃子进程"""
+        self._shutdown = True
+        for proc in list(self._active_procs):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        logger.info("Shutdown signal received, terminating active processes...")
+
     async def run(self):
         """主入口"""
         if not self.tasks:
@@ -648,7 +659,7 @@ class OpenCodeOrchestrator:
         # 注册信号处理器（必须在 asyncio.run 创建的循环上注册）
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: setattr(self, "_shutdown", True))
+            loop.add_signal_handler(sig, self._on_signal)
 
         # debug 模式下启动 web server
         if self.debug:
@@ -824,6 +835,7 @@ class OpenCodeOrchestrator:
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
                 )
+                self._active_procs.add(proc)
 
                 stdout_chunks: list[str] = []
                 stderr_chunks: list[str] = []
@@ -1003,6 +1015,9 @@ class OpenCodeOrchestrator:
                     await self._web_status(slot_id, "failed", 0.0)
 
             finally:
+                # 从活跃子进程集合中移除
+                if "proc" in locals():
+                    self._active_procs.discard(proc)
                 # 释放 web 槽位（无论成功/失败/异常）
                 if slot_id is not None:
                     await self._web_release(slot_id)
