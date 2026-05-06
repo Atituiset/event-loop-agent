@@ -645,7 +645,7 @@ class OpenCodeOrchestrator:
         """收到 SIGINT/SIGTERM 时：设置 shutdown 标志并 kill 所有活跃子进程
 
         双重信号策略:
-          - 第一次: 尝试优雅关闭 (kill 进程组 + 设 shutdown 标志)
+          - 第一次: 尝试优雅关闭 (kill 子进程 + 设 shutdown 标志)
           - 第二次: 强制退出 (os._exit，不等待任何清理)
         """
         self._sigint_count += 1
@@ -656,14 +656,7 @@ class OpenCodeOrchestrator:
         self._shutdown = True
         for proc in list(self._active_procs):
             try:
-                # 优先使用 killpg 杀死整个进程组（包括 nga 的孙子进程）
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                # 进程组不可用，回退到 kill 直接子进程
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                proc.kill()
             except Exception:
                 pass
         logger.info("Shutdown signal received, terminating active processes...")
@@ -843,20 +836,16 @@ class OpenCodeOrchestrator:
 
                 logger.debug(f"[{task.task_id}] Command: nga run '{message[:200]}...'")
 
-                # 2. 启动 nga 子进程
-                # 继承当前终端的 TERM，让 nga 正常输出
-                # ANSI 转义序列由 _read_stream 中的 ANSI_ESCAPE 正则兜底过滤
+                # 2. 启动 nga 子进程（TERM=dumb 抑制 ANSI 颜色码）
                 env = os.environ.copy()
+                env["TERM"] = "dumb"
                 proc = await asyncio.create_subprocess_exec(
-                    "stdbuf",
-                    "-oL",
                     self.nga_bin,
                     "run",
                     message,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
-                    preexec_fn=os.setpgrp,
                 )
                 self._active_procs.add(proc)
 
