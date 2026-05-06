@@ -327,6 +327,7 @@ class OpenCodeOrchestrator:
         self.tasks: list[ScanTask] = []
         self.semaphore = asyncio.Semaphore(concurrency)
         self._shutdown = False
+        self._sigint_count = 0
         self._active_procs: set[asyncio.subprocess.Process] = set()
 
         # 检查 nga 清理命令是否可用（用于清理 nga 残留的并发锁文件）
@@ -641,11 +642,28 @@ class OpenCodeOrchestrator:
     # ------------------------------------------------------------------
 
     def _on_signal(self):
-        """收到 SIGINT/SIGTERM 时：设置 shutdown 标志并 kill 所有活跃子进程"""
+        """收到 SIGINT/SIGTERM 时：设置 shutdown 标志并 kill 所有活跃子进程
+
+        双重信号策略:
+          - 第一次: 尝试优雅关闭 (kill 进程组 + 设 shutdown 标志)
+          - 第二次: 强制退出 (os._exit，不等待任何清理)
+        """
+        self._sigint_count += 1
+        if self._sigint_count >= 2:
+            logger.warning("Force exit on second SIGINT")
+            os._exit(1)
+
         self._shutdown = True
         for proc in list(self._active_procs):
             try:
-                proc.kill()
+                # 优先使用 killpg 杀死整个进程组（包括 nga 的孙子进程）
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                # 进程组不可用，回退到 kill 直接子进程
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
             except Exception:
                 pass
         logger.info("Shutdown signal received, terminating active processes...")
@@ -705,6 +723,8 @@ class OpenCodeOrchestrator:
 
     async def _cleanup_nga_locks(self, task_id: str):
         """执行 nga --cleanup-concurrency 清理残留锁"""
+        if self._shutdown:
+            return
         if not self._cleanup_available:
             return
         try:
@@ -752,8 +772,12 @@ class OpenCodeOrchestrator:
         这用于兜底：即使 Semaphore 释放了，如果 nga 进程（或其 daemon 子进程）
         还在系统中运行，我们等它消失后再启动新的，避免被 nga 的并发拦截。
         """
+        if self._shutdown:
+            return
         try:
             for attempt in range(20):  # 最多等 10 秒
+                if self._shutdown:
+                    return
                 proc = await asyncio.create_subprocess_exec(
                     "pgrep", "-x", "nga",
                     stdout=asyncio.subprocess.PIPE,
@@ -834,6 +858,7 @@ class OpenCodeOrchestrator:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
+                    preexec_fn=os.setpgrp,
                 )
                 self._active_procs.add(proc)
 
