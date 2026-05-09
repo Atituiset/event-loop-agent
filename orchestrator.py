@@ -317,12 +317,23 @@ class OpenCodeOrchestrator:
         session_timeout: int = 600,
         debug: bool = False,
         web_port: int = 8080,
+        isolate: bool = False,
     ):
         self.concurrency = concurrency
         self.nga_bin = nga_bin
         self.session_timeout = session_timeout
         self.debug = debug
         self.web_port = web_port
+        self.isolate = isolate
+
+        # namespace 隔离可用性检测
+        self._unshare_available = shutil.which("unshare") is not None
+        if self.isolate:
+            if not self._unshare_available:
+                logger.warning("--isolate requested but 'unshare' not found, falling back to normal mode")
+                self.isolate = False
+            else:
+                logger.info("Namespace isolation enabled (unshare --user --mount --pid)")
 
         self.tasks: list[ScanTask] = []
         self.semaphore = asyncio.Semaphore(concurrency)
@@ -811,14 +822,39 @@ class OpenCodeOrchestrator:
                     env["TERM"] = "xterm-256color"
                 else:
                     env["TERM"] = "dumb"
-                proc = await asyncio.create_subprocess_exec(
-                    self.nga_bin,
-                    "run",
-                    message,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                )
+
+                if self.isolate:
+                    # 用 unshare 创建隔离的 user + mount + pid namespace
+                    # 覆盖 /tmp 和 $HOME/.nga 防止 nga 全局锁冲突
+                    home = os.path.expanduser("~")
+                    nga_lock = os.path.join(home, ".nga")
+                    isolate_script = (
+                        'mount -t tmpfs tmpfs /tmp 2>/dev/null || true; '
+                        'mkdir -p /tmp/nga_isolated; '
+                        f'if [ -d "{nga_lock}" ]; then '
+                        f'mount --bind /tmp/nga_isolated "{nga_lock}" 2>/dev/null || true; '
+                        'fi; '
+                        'exec "$@"'
+                    )
+                    proc = await asyncio.create_subprocess_exec(
+                        "unshare", "--user", "--mount", "--pid", "--fork", "--map-root-user",
+                        "sh", "-c", isolate_script,
+                        "sh",  # $0
+                        self.nga_bin, "run", message,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=env,
+                    )
+                    logger.debug(f"[{task.task_id}] Started in namespace: unshare sh -c ... {self.nga_bin} run ...")
+                else:
+                    proc = await asyncio.create_subprocess_exec(
+                        self.nga_bin,
+                        "run",
+                        message,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=env,
+                    )
 
                 stdout_chunks: list[str] = []
                 stderr_chunks: list[str] = []
@@ -1043,7 +1079,11 @@ def main():
 
   # 启动 Web 调试界面（实时显示 NGA 输出）
   python orchestrator.py --diff abc123 --repo . --debug --web-port 8080
+
+  # 启用 namespace 隔离，绕过 nga 并发锁限制
+  python orchestrator.py --diff abc123 --repo . -c 5 --isolate
         """,
+
     )
 
     # 输入模式（互斥）
@@ -1097,6 +1137,11 @@ def main():
         default=8080,
         help="Web 调试界面端口（默认: 8080）",
     )
+    parser.add_argument(
+        "--isolate",
+        action="store_true",
+        help="启用 Linux namespace 隔离（unshare），让每个 nga 运行在独立的 mount+pid namespace 中，绕过 nga 并发锁限制",
+    )
 
     args = parser.parse_args()
 
@@ -1107,6 +1152,7 @@ def main():
         session_timeout=args.timeout,
         debug=args.debug,
         web_port=args.web_port,
+        isolate=args.isolate,
     )
 
     # 解析 cared_paths
