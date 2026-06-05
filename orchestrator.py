@@ -350,6 +350,7 @@ class OpenCodeOrchestrator:
 
         self.tasks: list[ScanTask] = []
         self.semaphore = asyncio.Semaphore(concurrency)
+        self._file_locks: dict[str, asyncio.Lock] = {}  # 文件级锁：同文件内函数串行执行
         self._shutdown = False
 
         # 检查 ngaent 清理命令是否可用（用于清理 nga 残留的并发锁文件）
@@ -984,277 +985,284 @@ class OpenCodeOrchestrator:
             logger.debug(f"[{task_id}] NGA slot check skipped: {e}")
 
     async def _scan_one(self, task: ScanTask, tracker: ProgressTracker):
-        """扫描单个文件"""
-        async with self.semaphore:
-            if self._shutdown:
-                logger.warning(
-                    f"[{task.task_id}] {task.file_path} | Skipped (shutdown)"
-                )
-                return
+        """扫描单个文件
 
-            # 启动前清理：处理上一个任务可能残留的锁/进程
-            await self._cleanup_nga_locks(task.task_id)
-            # 额外兜底：如果系统里还有 >=3 个 nga 进程，等它们退出
-            await self._wait_for_nga_slot(task.task_id)
-
-            task.status = "running"
-            task.start_time = time.time()
-            tracker.start_task()
-
-            logger.info(f"[{task.task_id}] START {task.file_path}")
-
-            # debug 模式下分配槽位并通知 web server
-            slot_id: Optional[int] = None
-            if self.debug and self.slot_manager is not None:
-                slot_id = await self.slot_manager.acquire(task.task_id, task.file_path)
-                task.slot_id = slot_id
-                await self._web_acquire(slot_id, task.task_id, task.file_path)
-                logger.info(f"[{task.task_id}] Assigned to web slot #{slot_id}")
-
-            try:
-                # 0. 计算动态超时
-                if task.function_name:
-                    # Full 模式：按函数代码行数估算
-                    try:
-                        from function_splitter import extract_functions
-                        functions = extract_functions(task.file_path)
-                        func = next((f for f in functions if f.name == task.function_name), None)
-                        func_lines = len(func.code_text.splitlines()) if func else 50
-                    except Exception:
-                        func_lines = 50
-                    extra = (func_lines // 10) * 30
-                    session_timeout = min(120 + extra, 300)
-                    logger.info(
-                        f"[{task.task_id}] {task.file_path}::{task.function_name} | "
-                        f"Func lines: {func_lines}, session timeout: {session_timeout}s"
-                    )
-                else:
-                    # Diff 模式：按 diff 行数计算
-                    diff_lines = len(task.diff_content.splitlines()) if task.diff_content else 0
-                    extra = (diff_lines // 10) * 60
-                    session_timeout = min(300 + extra, 900)
-                    logger.info(
-                        f"[{task.task_id}] {task.file_path} | Diff lines: {diff_lines}, "
-                        f"session timeout: {session_timeout}s"
-                    )
-
-                # 1. 构造命令参数
-                if task.function_name:
-                    message = self._build_full_scan_cmd(task)
-                elif task.diff_content:
-                    message = self._build_diff_scan_cmd(task)
-                else:
-                    message = f"review {task.file_path}"
-
-                logger.debug(f"[{task.task_id}] Command: nga run '{message[:200]}...'")
-
-                # 2. 启动 nga 子进程
-                # debug 模式下使用 TERM=xterm-256color 保留 ANSI 输出（捕获思考过程）
-                # 非 debug 模式下使用 TERM=dumb 过滤 ANSI
-                env = os.environ.copy()
-                if self.debug:
-                    env["TERM"] = "xterm-256color"
-                else:
-                    env["TERM"] = "dumb"
-                # 计算 --dir：优先用 workspace，否则用文件所在目录
-                dir_arg = self.workspace if self.workspace else str(Path(task.file_path).parent)
-                proc = await asyncio.create_subprocess_exec(
-                    self.nga_bin,
-                    "run",
-                    "--dir", dir_arg,
-                    message,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                )
-
-                stdout_chunks: list[str] = []
-                stderr_chunks: list[str] = []
-
-                # 打开 .log 文件，准备实时写入
-                log_fh = Path(task.log_file).open("w", encoding="utf-8")
-                log_fh.write(f"=== Task: {task.task_id} ===\n")
-                log_fh.write(f"File: {task.file_path}\n")
-                log_fh.write(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-
-                # 统计信息，用于超时诊断
-                io_stats = {"last_output_time": time.time(), "total_bytes": 0, "last_label": ""}
-
-                async def _read_stream(stream, chunks: list[str], label: str, fh, slot_id: Optional[int] = None):
-                    """实时读取 nga 输出：
-                    - 过滤 ANSI 后写入 log 文件（保留原有行为）
-                    - 推送原始内容（含 ANSI）到 web debug 界面（debug 模式）
-                    """
-                    while True:
-                        data = await stream.read(4096)
-                        if not data:
-                            break
-                        raw_text = data.decode("utf-8", errors="replace")
-                        # 推送原始内容到 web（保留 ANSI，让前端 ansi_up 渲染）
-                        if slot_id is not None:
-                            await self._web_push(slot_id, label, raw_text)
-                        # 过滤 ANSI 后用于 log 文件和后续报告
-                        clean_text = ANSI_ESCAPE.sub("", raw_text)
-                        chunks.append(clean_text)
-                        fh.write(clean_text)
-                        fh.flush()
-                        io_stats["last_output_time"] = time.time()
-                        io_stats["total_bytes"] += len(clean_text)
-                        io_stats["last_label"] = label
-
-                # 启动后台读取任务（传入 slot_id 用于 web 推送）
-                stdout_task = asyncio.create_task(
-                    _read_stream(proc.stdout, stdout_chunks, "stdout", log_fh, slot_id)
-                )
-                stderr_task = asyncio.create_task(
-                    _read_stream(proc.stderr, stderr_chunks, "stderr", log_fh, slot_id)
-                )
-
-                # 3. 等待 nga 进程结束（软超时 SIGTERM + 硬超时 SIGKILL）
-                soft_timeout = max(session_timeout - 30, int(session_timeout * 0.9))
-                try:
-                    task.returncode = await asyncio.wait_for(
-                        proc.wait(), timeout=soft_timeout
-                    )
-                    logger.debug(
-                        f"[{task.task_id}] Process exited with code {task.returncode}"
-                    )
-                except asyncio.TimeoutError:
-                    # 软超时：优雅关闭，给 nga 机会 flush 部分结果
+        并发控制策略：
+        - 文件级锁：同一文件内的函数串行执行（避免 nga 数据库锁冲突）
+        - 全局 Semaphore：不同文件之间可以并行（由 -c 参数控制）
+        """
+        file_lock = self._file_locks.setdefault(task.file_path, asyncio.Lock())
+        async with file_lock:
+            async with self.semaphore:
+                if self._shutdown:
                     logger.warning(
-                        f"[{task.task_id}] {task.file_path} | Soft timeout "
-                        f"({soft_timeout}s), sending SIGTERM to let nga flush "
-                        f"partial results..."
+                        f"[{task.task_id}] {task.file_path} | Skipped (shutdown)"
                     )
-                    log_fh.write("\n=== Soft Timeout ===\n")
-                    log_fh.write(
-                        f"Sent SIGTERM at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    )
-                    proc.send_signal(signal.SIGTERM)
+                    return
 
-                    try:
-                        task.returncode = await asyncio.wait_for(proc.wait(), timeout=30)
+                # 启动前清理：处理上一个任务可能残留的锁/进程
+                await self._cleanup_nga_locks(task.task_id)
+                # 额外兜底：如果系统里还有 >=3 个 nga 进程，等它们退出
+                await self._wait_for_nga_slot(task.task_id)
+
+                task.status = "running"
+                task.start_time = time.time()
+                tracker.start_task()
+
+                logger.info(f"[{task.task_id}] START {task.file_path}")
+
+                # debug 模式下分配槽位并通知 web server
+                slot_id: Optional[int] = None
+                if self.debug and self.slot_manager is not None:
+                    slot_id = await self.slot_manager.acquire(task.task_id, task.file_path)
+                    task.slot_id = slot_id
+                    await self._web_acquire(slot_id, task.task_id, task.file_path)
+                    logger.info(f"[{task.task_id}] Assigned to web slot #{slot_id}")
+
+                try:
+                    # 0. 计算动态超时
+                    if task.function_name:
+                        # Full 模式：按函数代码行数估算
+                        try:
+                            from function_splitter import extract_functions
+                            functions = extract_functions(task.file_path)
+                            func = next((f for f in functions if f.name == task.function_name), None)
+                            func_lines = len(func.code_text.splitlines()) if func else 50
+                        except Exception:
+                            func_lines = 50
+                        extra = (func_lines // 10) * 30
+                        session_timeout = min(120 + extra, 300)
                         logger.info(
-                            f"[{task.task_id}] {task.file_path} | "
-                            f"Graceful shutdown after SIGTERM"
+                            f"[{task.task_id}] {task.file_path}::{task.function_name} | "
+                            f"Func lines: {func_lines}, session timeout: {session_timeout}s"
+                        )
+                    else:
+                        # Diff 模式：按 diff 行数计算
+                        diff_lines = len(task.diff_content.splitlines()) if task.diff_content else 0
+                        extra = (diff_lines // 10) * 60
+                        session_timeout = min(300 + extra, 900)
+                        logger.info(
+                            f"[{task.task_id}] {task.file_path} | Diff lines: {diff_lines}, "
+                            f"session timeout: {session_timeout}s"
+                        )
+
+                    # 1. 构造命令参数
+                    if task.function_name:
+                        message = self._build_full_scan_cmd(task)
+                    elif task.diff_content:
+                        message = self._build_diff_scan_cmd(task)
+                    else:
+                        message = f"review {task.file_path}"
+
+                    logger.debug(f"[{task.task_id}] Command: nga run '{message[:200]}...'")
+
+                    # 2. 启动 nga 子进程
+                    # debug 模式下使用 TERM=xterm-256color 保留 ANSI 输出（捕获思考过程）
+                    # 非 debug 模式下使用 TERM=dumb 过滤 ANSI
+                    env = os.environ.copy()
+                    if self.debug:
+                        env["TERM"] = "xterm-256color"
+                    else:
+                        env["TERM"] = "dumb"
+                    # 计算 --dir：优先用 workspace，否则用文件所在目录
+                    dir_arg = self.workspace if self.workspace else str(Path(task.file_path).parent)
+                    proc = await asyncio.create_subprocess_exec(
+                        self.nga_bin,
+                        "run",
+                        "--dir", dir_arg,
+                        message,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=env,
+                    )
+
+                    stdout_chunks: list[str] = []
+                    stderr_chunks: list[str] = []
+
+                    # 打开 .log 文件，准备实时写入
+                    log_fh = Path(task.log_file).open("w", encoding="utf-8")
+                    log_fh.write(f"=== Task: {task.task_id} ===\n")
+                    log_fh.write(f"File: {task.file_path}\n")
+                    log_fh.write(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+                    # 统计信息，用于超时诊断
+                    io_stats = {"last_output_time": time.time(), "total_bytes": 0, "last_label": ""}
+
+                    async def _read_stream(stream, chunks: list[str], label: str, fh, slot_id: Optional[int] = None):
+                        """实时读取 nga 输出：
+                        - 过滤 ANSI 后写入 log 文件（保留原有行为）
+                        - 推送原始内容（含 ANSI）到 web debug 界面（debug 模式）
+                        """
+                        while True:
+                            data = await stream.read(4096)
+                            if not data:
+                                break
+                            raw_text = data.decode("utf-8", errors="replace")
+                            # 推送原始内容到 web（保留 ANSI，让前端 ansi_up 渲染）
+                            if slot_id is not None:
+                                await self._web_push(slot_id, label, raw_text)
+                            # 过滤 ANSI 后用于 log 文件和后续报告
+                            clean_text = ANSI_ESCAPE.sub("", raw_text)
+                            chunks.append(clean_text)
+                            fh.write(clean_text)
+                            fh.flush()
+                            io_stats["last_output_time"] = time.time()
+                            io_stats["total_bytes"] += len(clean_text)
+                            io_stats["last_label"] = label
+
+                    # 启动后台读取任务（传入 slot_id 用于 web 推送）
+                    stdout_task = asyncio.create_task(
+                        _read_stream(proc.stdout, stdout_chunks, "stdout", log_fh, slot_id)
+                    )
+                    stderr_task = asyncio.create_task(
+                        _read_stream(proc.stderr, stderr_chunks, "stderr", log_fh, slot_id)
+                    )
+
+                    # 3. 等待 nga 进程结束（软超时 SIGTERM + 硬超时 SIGKILL）
+                    soft_timeout = max(session_timeout - 30, int(session_timeout * 0.9))
+                    try:
+                        task.returncode = await asyncio.wait_for(
+                            proc.wait(), timeout=soft_timeout
+                        )
+                        logger.debug(
+                            f"[{task.task_id}] Process exited with code {task.returncode}"
                         )
                     except asyncio.TimeoutError:
-                        # 硬超时：强制 kill
-                        elapsed = time.time() - task.start_time
-                        last_out_ago = time.time() - io_stats["last_output_time"]
-                        diag = (
-                            f"Hard timeout after {session_timeout}s | "
-                            f"Last output: {last_out_ago:.1f}s ago | "
-                            f"Total bytes: {io_stats['total_bytes']}"
-                        )
+                        # 软超时：优雅关闭，给 nga 机会 flush 部分结果
                         logger.warning(
-                            f"[{task.task_id}] {task.file_path} | {diag}"
+                            f"[{task.task_id}] {task.file_path} | Soft timeout "
+                            f"({soft_timeout}s), sending SIGTERM to let nga flush "
+                            f"partial results..."
                         )
-                        log_fh.write("\n=== Hard Timeout ===\n")
-                        log_fh.write(f"Total runtime: {elapsed:.1f}s\n")
+                        log_fh.write("\n=== Soft Timeout ===\n")
                         log_fh.write(
-                            f"Last output received: {last_out_ago:.1f}s ago\n"
+                            f"Sent SIGTERM at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                         )
-                        log_fh.write(
-                            f"Total bytes collected: {io_stats['total_bytes']}\n"
+                        proc.send_signal(signal.SIGTERM)
+
+                        try:
+                            task.returncode = await asyncio.wait_for(proc.wait(), timeout=30)
+                            logger.info(
+                                f"[{task.task_id}] {task.file_path} | "
+                                f"Graceful shutdown after SIGTERM"
+                            )
+                        except asyncio.TimeoutError:
+                            # 硬超时：强制 kill
+                            elapsed = time.time() - task.start_time
+                            last_out_ago = time.time() - io_stats["last_output_time"]
+                            diag = (
+                                f"Hard timeout after {session_timeout}s | "
+                                f"Last output: {last_out_ago:.1f}s ago | "
+                                f"Total bytes: {io_stats['total_bytes']}"
+                            )
+                            logger.warning(
+                                f"[{task.task_id}] {task.file_path} | {diag}"
+                            )
+                            log_fh.write("\n=== Hard Timeout ===\n")
+                            log_fh.write(f"Total runtime: {elapsed:.1f}s\n")
+                            log_fh.write(
+                                f"Last output received: {last_out_ago:.1f}s ago\n"
+                            )
+                            log_fh.write(
+                                f"Total bytes collected: {io_stats['total_bytes']}\n"
+                            )
+                            proc.kill()
+                            await proc.wait()
+                            # 清理可能残留的子进程，避免它们变成孤儿进程占用 nga 并发
+                            await self._cleanup_children(proc.pid)
+                            task.returncode = -1
+                            task.error = diag
+
+                    # 等待读取任务完成（进程结束后 pipe 会 EOF，读取任务自然退出）
+                    await asyncio.gather(stdout_task, stderr_task)
+
+                    task.end_time = time.time()
+                    task.stdout = "".join(stdout_chunks)
+                    task.stderr = "".join(stderr_chunks)
+
+                    # 6. 判断结果
+                    if task.returncode == 0 and not task.error:
+                        task.status = "done"
+                        logger.info(
+                            f"[{task.task_id}] DONE {task.duration}s | {task.file_path}"
                         )
-                        proc.kill()
-                        await proc.wait()
-                        # 清理可能残留的子进程，避免它们变成孤儿进程占用 nga 并发
-                        await self._cleanup_children(proc.pid)
-                        task.returncode = -1
-                        task.error = diag
+                    else:
+                        task.status = "failed"
+                        if not task.error:
+                            task.error = task.stderr[:200] if task.stderr else "Unknown error"
+                        logger.error(
+                            f"[{task.task_id}] FAILED (code={task.returncode}) | {task.file_path} | {task.error}"
+                        )
 
-                # 等待读取任务完成（进程结束后 pipe 会 EOF，读取任务自然退出）
-                await asyncio.gather(stdout_task, stderr_task)
+                    # 7. 生成 Markdown 报告（只含审查结果）
+                    report_md = generate_report(task)
+                    Path(task.report_file).write_text(report_md, encoding="utf-8")
+                    logger.debug(f"[{task.task_id}] Report saved: {task.report_file}")
 
-                task.end_time = time.time()
-                task.stdout = "".join(stdout_chunks)
-                task.stderr = "".join(stderr_chunks)
+                    # 追加尾部统计到 .log 文件并关闭
+                    log_fh.write("\n=== End ===\n")
+                    log_fh.write(f"Status: {task.status}\n")
+                    log_fh.write(f"Duration: {task.duration}s\n")
+                    log_fh.write(f"Return code: {task.returncode}\n")
+                    if task.error:
+                        log_fh.write(f"Error: {task.error}\n")
+                    log_fh.close()
+                    logger.debug(f"[{task.task_id}] Log saved: {task.log_file}")
 
-                # 6. 判断结果
-                if task.returncode == 0 and not task.error:
-                    task.status = "done"
-                    logger.info(
-                        f"[{task.task_id}] DONE {task.duration}s | {task.file_path}"
-                    )
-                else:
+                    tracker.complete_task(success=(task.status == "done"))
+
+                    # 通知 web server 任务状态变更
+                    if slot_id is not None:
+                        await self._web_status(slot_id, task.status, task.duration)
+
+                except Exception as e:
                     task.status = "failed"
-                    if not task.error:
-                        task.error = task.stderr[:200] if task.stderr else "Unknown error"
+                    task.end_time = time.time()
+                    task.error = str(e)
                     logger.error(
-                        f"[{task.task_id}] FAILED (code={task.returncode}) | {task.file_path} | {task.error}"
+                        f"[{task.task_id}] {task.file_path} | EXCEPTION: {e}"
                     )
-
-                # 7. 生成 Markdown 报告（只含审查结果）
-                report_md = generate_report(task)
-                Path(task.report_file).write_text(report_md, encoding="utf-8")
-                logger.debug(f"[{task.task_id}] Report saved: {task.report_file}")
-
-                # 追加尾部统计到 .log 文件并关闭
-                log_fh.write("\n=== End ===\n")
-                log_fh.write(f"Status: {task.status}\n")
-                log_fh.write(f"Duration: {task.duration}s\n")
-                log_fh.write(f"Return code: {task.returncode}\n")
-                if task.error:
-                    log_fh.write(f"Error: {task.error}\n")
-                log_fh.close()
-                logger.debug(f"[{task.task_id}] Log saved: {task.log_file}")
-
-                tracker.complete_task(success=(task.status == "done"))
-
-                # 通知 web server 任务状态变更
-                if slot_id is not None:
-                    await self._web_status(slot_id, task.status, task.duration)
-
-            except Exception as e:
-                task.status = "failed"
-                task.end_time = time.time()
-                task.error = str(e)
-                logger.error(
-                    f"[{task.task_id}] {task.file_path} | EXCEPTION: {e}"
-                )
-                # 异常退出时，nga 子进程可能还在运行，必须强制终止
-                if "proc" in locals() and proc is not None and proc.returncode is None:
-                    logger.warning(
-                        f"[{task.task_id}] Killing leaked nga process "
-                        f"(pid={proc.pid}) due to exception"
-                    )
+                    # 异常退出时，nga 子进程可能还在运行，必须强制终止
+                    if "proc" in locals() and proc is not None and proc.returncode is None:
+                        logger.warning(
+                            f"[{task.task_id}] Killing leaked nga process "
+                            f"(pid={proc.pid}) due to exception"
+                        )
+                        try:
+                            proc.kill()
+                            await asyncio.wait_for(proc.wait(), timeout=5)
+                        except Exception:
+                            pass
+                        # 尝试清理子进程
+                        await self._cleanup_children(proc.pid)
+                    # 确保读取任务也被取消，避免挂起导致 Semaphore 不释放
+                    if "stdout_task" in locals() and stdout_task is not None:
+                        stdout_task.cancel()
+                    if "stderr_task" in locals() and stderr_task is not None:
+                        stderr_task.cancel()
+                    # 确保 log 文件被关闭，并追加异常信息
                     try:
-                        proc.kill()
-                        await asyncio.wait_for(proc.wait(), timeout=5)
+                        if "log_fh" in locals() and log_fh is not None and not log_fh.closed:
+                            log_fh.write(f"\n=== Exception ===\n{e}\n")
+                            log_fh.close()
                     except Exception:
                         pass
-                    # 尝试清理子进程
-                    await self._cleanup_children(proc.pid)
-                # 确保读取任务也被取消，避免挂起导致 Semaphore 不释放
-                if "stdout_task" in locals() and stdout_task is not None:
-                    stdout_task.cancel()
-                if "stderr_task" in locals() and stderr_task is not None:
-                    stderr_task.cancel()
-                # 确保 log 文件被关闭，并追加异常信息
-                try:
-                    if "log_fh" in locals() and log_fh is not None and not log_fh.closed:
-                        log_fh.write(f"\n=== Exception ===\n{e}\n")
-                        log_fh.close()
-                except Exception:
-                    pass
-                tracker.complete_task(success=False)
+                    tracker.complete_task(success=False)
 
-                # 通知 web server 异常状态
-                if slot_id is not None:
-                    await self._web_status(slot_id, "failed", 0.0)
+                    # 通知 web server 异常状态
+                    if slot_id is not None:
+                        await self._web_status(slot_id, "failed", 0.0)
 
-            finally:
-                # 释放 web 槽位（无论成功/失败/异常）
-                if slot_id is not None:
-                    await self._web_release(slot_id)
-                    if self.slot_manager is not None:
-                        await self.slot_manager.release(slot_id)
-                    logger.info(f"[{task.task_id}] Released web slot #{slot_id}")
+                finally:
+                    # 释放 web 槽位（无论成功/失败/异常）
+                    if slot_id is not None:
+                        await self._web_release(slot_id)
+                        if self.slot_manager is not None:
+                            await self.slot_manager.release(slot_id)
+                        logger.info(f"[{task.task_id}] Released web slot #{slot_id}")
 
-        # 任务完成后执行清理（兜底：清理本任务可能残留的锁）
-        await self._cleanup_nga_locks(task.task_id)
+            # 任务完成后执行清理（兜底：清理本任务可能残留的锁）
+            await self._cleanup_nga_locks(task.task_id)
 
     def _save_summary(self, total_time: float):
         """保存 Markdown 汇总报告"""
