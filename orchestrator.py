@@ -228,7 +228,7 @@ def generate_log(task: ScanTask) -> str:
     return "\n".join(lines)
 
 
-def generate_summary(tasks: list[ScanTask], total_time: float) -> str:
+def generate_summary(tasks: list[ScanTask], total_time: float, output_dir: Path) -> str:
     """生成 Markdown 汇总报告"""
     done = sum(1 for t in tasks if t.status == "done")
     failed = sum(1 for t in tasks if t.status == "failed")
@@ -267,8 +267,9 @@ def generate_summary(tasks: list[ScanTask], total_time: float) -> str:
             func_name = t.function_name or "(整文件)"
             report_name = Path(t.report_file).name
             log_name = Path(t.log_file).name
-            report_link = f"[{report_name}]({Path(t.report_file).relative_to(Path(t.report_file).parents[-3])})"
-            log_link = f"[{log_name}]({Path(t.log_file).relative_to(Path(t.log_file).parents[-3])})"
+            # 链接相对于 summary.md 所在目录
+            report_link = f"[{report_name}]({Path(t.report_file).relative_to(output_dir)})"
+            log_link = f"[{log_name}]({Path(t.log_file).relative_to(output_dir)})"
             lines.append(
                 f"| {i} | `{func_name}` | {status_icon} {t.status} | {t.duration}s | {report_link} | {log_link} |"
             )
@@ -1257,7 +1258,7 @@ class OpenCodeOrchestrator:
 
     def _save_summary(self, total_time: float):
         """保存 Markdown 汇总报告"""
-        summary_md = generate_summary(self.tasks, total_time)
+        summary_md = generate_summary(self.tasks, total_time, self.output_dir)
         summary_file = self.output_dir / "summary.md"
         summary_file.write_text(summary_md, encoding="utf-8")
         logger.info(f"Summary report: {summary_file}")
