@@ -101,7 +101,9 @@ tree-sitter-cpp
 - `function_name`：函数名（从 `declarator` 子节点提取）
 - `start_line`：函数起始行号（1-based）
 - `end_line`：函数结束行号（1-based）
-- `code_text`：函数完整代码文本（含注释）
+- `code_text`：函数完整代码文本（**包含前置注释**，如 doxygen / 函数头说明）
+
+**前置注释包含策略**：检查 `function_definition` 节点之前是否紧跟 `comment` 节点（允许中间有空白），如果是，则将该注释块也包含进 `code_text`。这对审查很重要——注释中常包含接口契约、前置条件、边界说明。
 
 ### 函数名提取规则
 
@@ -115,6 +117,8 @@ tree-sitter-cpp
 ```
 
 函数名用于生成报告文件名和 task_id，需要保证文件系统安全（替换非法字符为 `_`）。
+
+**重载函数处理**：同一文件内可能存在同名重载函数（C++），报告文件名会冲突。采用 `{函数名}_{起始行号}` 作为报告文件名，如 `process_pdu_145.md`，保证唯一性。
 
 ### Fallback 机制
 
