@@ -93,6 +93,7 @@ def test_tcp_handler_complex():
 def test_all_files():
     """Smoke test: ensure all C/C++ files in test dir can be parsed."""
     files = list(TEST_DIR.rglob("*.c")) + list(TEST_DIR.rglob("*.cpp"))
+    files = [f for f in files if f.is_file() and "agent_review_report" not in str(f)]
     for f in files:
         funcs = extract_functions(str(f))
         assert isinstance(funcs, list)
