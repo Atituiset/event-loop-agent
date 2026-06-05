@@ -516,17 +516,25 @@ class OpenCodeOrchestrator:
         """
         path_obj = Path(file_path)
 
-        # 处理绝对路径：转换为简化路径
+        # 处理绝对路径：转换为相对路径
         if path_obj.is_absolute():
-            try:
-                path_obj = path_obj.relative_to(Path.cwd())
-            except ValueError:
-                # 外部路径：简化，如 /home/user/Projects/app/main.c -> app/main.c
-                parts = path_obj.parts
-                if len(parts) > 3:
-                    path_obj = Path(*parts[3:])
-                else:
-                    path_obj = Path(path_obj.name)
+            # 优先相对于 workspace
+            if self.workspace:
+                try:
+                    path_obj = path_obj.relative_to(self.workspace)
+                except ValueError:
+                    pass  # 不在 workspace 下，继续下面的 fallback
+            # 再尝试相对于当前目录
+            if path_obj.is_absolute():
+                try:
+                    path_obj = path_obj.relative_to(Path.cwd())
+                except ValueError:
+                    # 最终 fallback：取尾部目录
+                    parts = path_obj.parts
+                    if len(parts) > 3:
+                        path_obj = Path(*parts[3:])
+                    else:
+                        path_obj = Path(path_obj.name)
 
         sub_dir = path_obj.parent
         file_stem = path_obj.stem
