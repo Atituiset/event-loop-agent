@@ -108,8 +108,15 @@ def _get_return_type(node: Node) -> str:
         if child.type in ("type_identifier", "primitive_type", "sized_type_specifier"):
             parts.append(child.text.decode("utf-8"))
         elif child.type in ("pointer_declarator", "reference_declarator"):
-            # 返回类型可能是指针/引用，继续解析但还没到函数声明符
-            pass
+            # 返回类型包含 * 或 &
+            ptr_text = child.text.decode("utf-8")
+            # 只取 * 或 & 部分，不要函数名
+            if "*" in ptr_text:
+                parts.append("*")
+            if "&" in ptr_text:
+                parts.append("&")
+        elif child.type in ("enum_specifier", "class_specifier", "struct_specifier"):
+            parts.append(child.text.decode("utf-8"))
         elif child.type == "function_declarator":
             break  # 遇到函数声明符就停止
     return " ".join(parts) if parts else "void"
@@ -148,6 +155,8 @@ def _get_parameters(node: Node) -> list[dict]:
             is_pointer = False
             for pc in param.children:
                 if pc.type in ("type_identifier", "primitive_type", "sized_type_specifier"):
+                    ptype += pc.text.decode("utf-8") + " "
+                elif pc.type in ("enum_specifier", "class_specifier", "struct_specifier"):
                     ptype += pc.text.decode("utf-8") + " "
                 elif pc.type in ("pointer_declarator", "reference_declarator"):
                     is_pointer = True
@@ -206,6 +215,10 @@ def _has_memory_ops(node: Node) -> list[str]:
                             break
             if func_name in _MEMORY_FUNCS:
                 found.add(func_name)
+        elif n.type == "new_expression":
+            found.add("new")
+        elif n.type == "delete_expression":
+            found.add("delete")
         for c in n.children:
             _scan(c)
 
