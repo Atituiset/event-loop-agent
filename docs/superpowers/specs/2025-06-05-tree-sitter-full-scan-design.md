@@ -102,8 +102,37 @@ tree-sitter-cpp
 - `start_line`：函数起始行号（1-based）
 - `end_line`：函数结束行号（1-based）
 - `code_text`：函数完整代码文本（**包含前置注释**，如 doxygen / 函数头说明）
+- `metadata`：AST 元数据字典（见下方）
 
 **前置注释包含策略**：检查 `function_definition` 节点之前是否紧跟 `comment` 节点（允许中间有空白），如果是，则将该注释块也包含进 `code_text`。这对审查很重要——注释中常包含接口契约、前置条件、边界说明。
+
+### AST 元数据提取
+
+除函数代码文本外，从 AST 中提取结构化元数据，作为 prompt 的"函数摘要"区块：
+
+| 元数据项 | 来源 | 说明 |
+|---------|------|------|
+| `return_type` | `function_definition` 的 type 子节点 | 返回类型文本（如 `int`, `void*`, `std::string`） |
+| `parameters` | `parameter_list` 子节点 | 参数列表，每项为 `{type, name}` |
+| `modifiers` | 遍历 `declaration`/`function_definition` 的前置子节点 | `static`, `inline`, `virtual`, `const`, `constexpr` 等 |
+| `has_memory_ops` | 扫描函数体中的标识符 | 是否包含 `malloc`/`free`/`memcpy`/`strcpy`/`memset` 等 |
+| `branch_count` | 计数函数体中的控制流节点 | `if`/`switch`/`while`/`for`/`do`/`try` 的数量 |
+
+元数据通过纯 AST 遍历提取，不依赖正则，精确可靠。
+
+**元数据在 prompt 中的展示：**
+
+```
+=== 函数元数据 ===
+返回类型: int
+参数列表:
+  - uint8_t *buf (指针)
+  - size_t len (基本类型)
+修饰符: static
+内存操作: 有 (malloc, free)
+分支复杂度: 3 (if x2, for x1)
+==================
+```
 
 ### 函数名提取规则
 
@@ -165,6 +194,15 @@ Full 模式下发送给 nga 的 prompt 格式：
 文件: {file_path}
 函数名: {function_name}
 行号: {start_line}-{end_line}
+
+=== 函数元数据 ===
+返回类型: {return_type}
+参数列表:
+{parameters}
+修饰符: {modifiers}
+内存操作: {memory_ops}
+分支复杂度: {branch_count}
+==================
 
 ```c
 {code_text}
