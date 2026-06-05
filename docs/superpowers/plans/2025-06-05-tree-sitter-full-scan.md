@@ -276,6 +276,7 @@ class FunctionInfo:
     start_line: int
     end_line: int
     code_text: str
+    metadata: dict = field(default_factory=dict)  # AST 元数据
 
 
 def _get_language(file_path: str) -> Language:
@@ -352,6 +353,139 @@ def _get_preceding_comment(node: Node, source_bytes: bytes) -> str:
     return ""
 
 
+def _get_return_type(node: Node) -> str:
+    """从 function_definition 提取返回类型文本"""
+    parts = []
+    for child in node.children:
+        if child.type in ("type_identifier", "primitive_type", "sized_type_specifier"):
+            parts.append(child.text.decode("utf-8"))
+        elif child.type in ("pointer_declarator", "reference_declarator"):
+            # 返回类型可能是指针/引用，需要继续解析
+            pass
+        elif child.type == "function_declarator":
+            break  # 遇到函数声明符就停止
+    return " ".join(parts) if parts else "void"
+
+
+def _get_parameters(node: Node) -> list[dict]:
+    """从 function_definition 提取参数列表"""
+    params = []
+    # 找到 parameter_list
+    param_list = None
+    for child in node.children:
+        if child.type == "function_declarator":
+            for gc in child.children:
+                if gc.type == "parameter_list":
+                    param_list = gc
+                    break
+            break
+
+    if param_list is None:
+        return params
+
+    for param in param_list.children:
+        if param.type == "parameter_declaration":
+            ptype = ""
+            pname = ""
+            is_pointer = False
+            for pc in param.children:
+                if pc.type in ("type_identifier", "primitive_type", "sized_type_specifier"):
+                    ptype += pc.text.decode("utf-8") + " "
+                elif pc.type in ("pointer_declarator", "reference_declarator"):
+                    is_pointer = True
+                    for pcc in pc.children:
+                        if pcc.type == "identifier":
+                            pname = pcc.text.decode("utf-8")
+                elif pc.type == "identifier":
+                    pname = pc.text.decode("utf-8")
+                elif pc.type == "array_declarator":
+                    is_pointer = True
+                    for pcc in pc.children:
+                        if pcc.type == "identifier":
+                            pname = pcc.text.decode("utf-8")
+            ptype = ptype.strip()
+            if is_pointer:
+                ptype += "*"
+            if ptype or pname:
+                params.append({"type": ptype or "unknown", "name": pname or "_"})
+
+    return params
+
+
+def _get_modifiers(node: Node) -> list[str]:
+    """提取函数修饰符（static, inline, virtual, const, constexpr）"""
+    mods = []
+    # 检查 function_definition 前面的 storage_class_specifier 等
+    for child in node.children:
+        if child.type in ("storage_class_specifier", "function_specifier",
+                          "type_qualifier", "virtual"):
+            mods.append(child.text.decode("utf-8"))
+    return mods
+
+
+def _has_memory_ops(node: Node) -> list[str]:
+    """扫描函数体中是否包含内存操作函数调用"""
+    memory_funcs = {"malloc", "calloc", "realloc", "free",
+                    "memcpy", "memmove", "memset", "strcpy",
+                    "strncpy", "strcat", "sprintf", "snprintf"}
+    found = set()
+
+    def _scan(n: Node):
+        if n.type == "call_expression":
+            func_name = ""
+            for c in n.children:
+                if c.type == "identifier":
+                    func_name = c.text.decode("utf-8")
+                    break
+                elif c.type == "field_expression":
+                    for cc in c.children:
+                        if cc.type == "field_identifier":
+                            func_name = cc.text.decode("utf-8")
+                            break
+            if func_name in memory_funcs:
+                found.add(func_name)
+        for c in n.children:
+            _scan(c)
+
+    _scan(node)
+    return sorted(found)
+
+
+def _count_branches(node: Node) -> dict[str, int]:
+    """统计函数体中的控制流节点数量"""
+    counts = {"if": 0, "switch": 0, "while": 0, "for": 0, "do": 0, "try": 0}
+
+    def _scan(n: Node):
+        t = n.type
+        if t in counts:
+            counts[t] += 1
+        for c in n.children:
+            _scan(c)
+
+    _scan(node)
+    return counts
+
+
+def _extract_metadata(node: Node) -> dict:
+    """从 function_definition 节点提取 AST 元数据"""
+    return_type = _get_return_type(node)
+    parameters = _get_parameters(node)
+    modifiers = _get_modifiers(node)
+    memory_ops = _has_memory_ops(node)
+    branch_counts = _count_branches(node)
+    total_branches = sum(branch_counts.values())
+
+    return {
+        "return_type": return_type,
+        "parameters": parameters,
+        "modifiers": modifiers,
+        "has_memory_ops": bool(memory_ops),
+        "memory_ops": memory_ops,
+        "branch_count": total_branches,
+        "branch_breakdown": branch_counts,
+    }
+
+
 def _walk_functions(node: Node, functions: list[FunctionInfo],
                     source_bytes: bytes, source_text: str) -> None:
     """递归遍历 AST，收集函数定义节点"""
@@ -362,6 +496,9 @@ def _walk_functions(node: Node, functions: list[FunctionInfo],
 
         start_line = node.start_point[0] + 1  # 0-based → 1-based
         end_line = node.end_point[0] + 1
+
+        # 提取 AST 元数据
+        metadata = _extract_metadata(node)
 
         # 提取代码文本（含前置注释）
         comment = _get_preceding_comment(node, source_bytes)
@@ -374,6 +511,7 @@ def _walk_functions(node: Node, functions: list[FunctionInfo],
             start_line=start_line,
             end_line=end_line,
             code_text=code_text,
+            metadata=metadata,
         ))
 
     for child in node.children:
@@ -467,6 +605,47 @@ def test_cpp_overload_names():
     assert len(process_funcs) == 2
     # They should have different line numbers
     assert process_funcs[0].start_line != process_funcs[1].start_line
+
+
+def test_metadata_return_type():
+    funcs = extract_functions(str(FIXTURES / "sample.c"))
+    pdu = next(f for f in funcs if f.name == "process_pdu")
+    assert pdu.metadata["return_type"] == "int"
+
+
+def test_metadata_parameters():
+    funcs = extract_functions(str(FIXTURES / "sample.c"))
+    pdu = next(f for f in funcs if f.name == "process_pdu")
+    params = pdu.metadata["parameters"]
+    assert len(params) == 2
+    assert params[0]["name"] == "buf"
+    assert "uint8_t" in params[0]["type"]
+    assert params[1]["name"] == "len"
+    assert "size_t" in params[1]["type"]
+
+
+def test_metadata_modifiers():
+    funcs = extract_functions(str(FIXTURES / "sample.c"))
+    decode = next(f for f in funcs if f.name == "decode_tlv")
+    assert "static" in decode.metadata["modifiers"]
+
+
+def test_metadata_memory_ops():
+    funcs = extract_functions(str(FIXTURES / "sample.c"))
+    decode = next(f for f in funcs if f.name == "decode_tlv")
+    assert decode.metadata["has_memory_ops"] is True
+    assert "memcpy" in decode.metadata["memory_ops"]
+
+    cleanup = next(f for f in funcs if f.name == "cleanup")
+    assert cleanup.metadata["has_memory_ops"] is True
+    assert "free" in cleanup.metadata["memory_ops"]
+
+
+def test_metadata_branch_count():
+    funcs = extract_functions(str(FIXTURES / "sample.c"))
+    pdu = next(f for f in funcs if f.name == "process_pdu")
+    assert pdu.metadata["branch_count"] >= 3  # if x2 + if x1
+    assert pdu.metadata["branch_breakdown"]["if"] >= 3
 ```
 
 运行测试，确认失败：
@@ -750,11 +929,34 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
             logger.warning(f"[{task.task_id}] Failed to extract function code: {e}")
             return f"review {task.file_path}"
 
+        # 构建 AST 元数据区块
+        meta = func.metadata
+        param_lines = "\n".join(
+            f"  - {p['type']} {p['name']}" for p in meta.get("parameters", [])
+        ) or "  - (无参数)"
+
+        modifier_str = ", ".join(meta.get("modifiers", [])) or "无"
+
+        mem_ops = meta.get("memory_ops", [])
+        mem_str = ", ".join(mem_ops) if mem_ops else "无"
+
+        branch = meta.get("branch_count", 0)
+        branch_detail = meta.get("branch_breakdown", {})
+        branch_parts = [f"{k} x{v}" for k, v in branch_detail.items() if v > 0]
+        branch_str = f"{branch} ({', '.join(branch_parts)})" if branch_parts else "0"
+
         message = (
             f"请审查以下 C/C++ 函数，应用无线通信安全编码规则（RULE-001~RULE-010）进行全面检查：\n\n"
             f"文件: {task.file_path}\n"
             f"函数名: {task.function_name}\n"
             f"行号: {func.start_line}-{func.end_line}\n\n"
+            f"=== 函数元数据 ===\n"
+            f"返回类型: {meta.get('return_type', 'void')}\n"
+            f"参数列表:\n{param_lines}\n"
+            f"修饰符: {modifier_str}\n"
+            f"内存操作: {mem_str}\n"
+            f"分支复杂度: {branch_str}\n"
+            f"==================\n\n"
             f"```c\n"
             f"{func.code_text}\n"
             f"```\n\n"
@@ -1116,6 +1318,8 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 | tree-sitter 切分模块 | Task 3 |
 | 函数名提取（含 C++ 方法） | Task 3 |
 | 前置注释包含 | Task 3-4 |
+| AST 元数据提取（返回类型、参数、修饰符、内存操作、分支） | Task 3 |
+| 元数据注入 prompt | Task 7 |
 | 重载函数处理（行号后缀） | Task 6 (_get_output_paths) |
 | 函数级 NGA prompt | Task 7 |
 | 函数级输出路径 | Task 6 |
