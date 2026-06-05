@@ -680,14 +680,36 @@ class OpenCodeOrchestrator:
             elif path.is_dir():
                 for ext in source_extensions:
                     for p in path.rglob(f"*{ext}"):
+                        # 排除报告输出目录，避免递归扫描自己生成的报告
+                        if "agent_review_report" in str(p):
+                            continue
                         all_files.append(str(p))
             else:
                 logger.warning(f"Path not found: {fp}")
 
         all_files = sorted(set(all_files))
 
+        # 过滤 cared_paths
         if cared_paths:
-            all_files = self._filter_by_cared_paths(all_files, cared_paths)
+            # 构建 (相对路径 -> 原始路径) 映射，用相对路径做前缀匹配过滤
+            rel_map: dict[str, str] = {}
+            for fp in all_files:
+                p = Path(fp)
+                rel = fp
+                if p.is_absolute():
+                    if self.workspace:
+                        try:
+                            rel = str(p.relative_to(self.workspace))
+                        except ValueError:
+                            pass
+                    else:
+                        try:
+                            rel = str(p.relative_to(Path.cwd()))
+                        except ValueError:
+                            pass
+                rel_map[rel] = fp
+            filtered_rel = self._filter_by_cared_paths(list(rel_map.keys()), cared_paths)
+            all_files = [rel_map[r] for r in filtered_rel]
             logger.info(f"After cared_paths filter: {len(all_files)} files")
 
         # 逐文件切分函数
