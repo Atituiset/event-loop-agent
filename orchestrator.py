@@ -338,12 +338,14 @@ class OpenCodeOrchestrator:
         session_timeout: int = 600,
         debug: bool = False,
         web_port: int = 8080,
+        workspace: str = "",
     ):
         self.concurrency = concurrency
         self.nga_bin = nga_bin
         self.session_timeout = session_timeout
         self.debug = debug
         self.web_port = web_port
+        self.workspace = workspace
 
         self.tasks: list[ScanTask] = []
         self.semaphore = asyncio.Semaphore(concurrency)
@@ -368,7 +370,10 @@ class OpenCodeOrchestrator:
                 logger.warning("httpx not installed, web debug will not work. Run: pip install httpx")
 
         # 输出目录
-        self.output_dir = Path("reports") / datetime.now().strftime("%Y%m%d_%H%M%S")
+        if self.workspace:
+            self.output_dir = Path(self.workspace) / "agent_review_report" / datetime.now().strftime("%Y%m%d_%H%M%S")
+        else:
+            self.output_dir = Path("reports") / datetime.now().strftime("%Y%m%d_%H%M%S")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Output directory: {self.output_dir}")
 
@@ -1020,9 +1025,12 @@ class OpenCodeOrchestrator:
                     env["TERM"] = "xterm-256color"
                 else:
                     env["TERM"] = "dumb"
+                # 计算 --dir：优先用 workspace，否则用文件所在目录
+                dir_arg = self.workspace if self.workspace else str(Path(task.file_path).parent)
                 proc = await asyncio.create_subprocess_exec(
                     self.nga_bin,
                     "run",
+                    "--dir", dir_arg,
                     message,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -1318,6 +1326,11 @@ def main():
         default=8080,
         help="Web 调试界面端口（默认: 8080）",
     )
+    parser.add_argument(
+        "--workspace",
+        default="",
+        help="nga 工作目录，传给 --dir 参数（默认使用被扫描文件所在目录）",
+    )
 
     args = parser.parse_args()
 
@@ -1328,6 +1341,7 @@ def main():
         session_timeout=args.timeout,
         debug=args.debug,
         web_port=args.web_port,
+        workspace=args.workspace,
     )
 
     # 解析 cared_paths
