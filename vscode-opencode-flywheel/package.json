@@ -21,7 +21,7 @@
         {
           "id": "opencodeFlywheel",
           "title": "OpenCode",
-          "icon": "$(comment-discussion)"
+          "icon": "resources/icon.svg"
         }
       ]
     },
