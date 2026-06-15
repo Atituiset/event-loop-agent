@@ -1,0 +1,32 @@
+[project]
+name = "event-loop-agent"
+version = "0.2.0"
+description = "Async parallel orchestrator for AI-assisted C/C++ code review with data flywheel feedback"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "gunicorn>=21.0.0",
+    "httpx>=0.24.0",
+    "starlette>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+tree-sitter = [
+    "tree-sitter>=0.20.0",
+    "tree-sitter-c>=0.20.0",
+    "tree-sitter-cpp>=0.20.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
