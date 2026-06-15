@@ -24,6 +24,7 @@ tree-sitter = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.uv]
 dev-dependencies = [
