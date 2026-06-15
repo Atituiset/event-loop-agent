@@ -1,3 +1,12 @@
 <svg width="28" height="28" viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg">
-  <path fill="currentColor" d="M4 5h20v3H4zm0 5h20v2H4zm0 4h12v2H4zm14.5 0a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7zm-5.3 7.7a5.5 5.5 0 1 1 1.4-1.4l3.4 3.4-1.4 1.4-3.4-3.4z"/>
+  <!-- Robot head -->
+  <rect x="6" y="5" width="16" height="14" rx="3" fill="currentColor"/>
+  <!-- Eyes -->
+  <rect x="9" y="10" width="3" height="4" rx="1" fill="var(--vscode-activityBar-background, #000)"/>
+  <rect x="16" y="10" width="3" height="4" rx="1" fill="var(--vscode-activityBar-background, #000)"/>
+  <!-- Antenna -->
+  <line x1="14" y1="5" x2="14" y2="2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="14" cy="2" r="1.5" fill="currentColor"/>
+  <!-- Neck/body hint -->
+  <rect x="11" y="19" width="6" height="3" rx="1" fill="currentColor"/>
 </svg>
