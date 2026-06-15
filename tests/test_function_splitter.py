@@ -2,7 +2,7 @@
 
 import pytest
 from pathlib import Path
-from function_splitter import extract_functions
+from opencode_agent.scanner.splitter import extract_functions
 
 TEST_DIR = Path("/home/atituiset/Projects/opencode-c-cpp-test")
 

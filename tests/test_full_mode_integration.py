@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from orchestrator import OpenCodeOrchestrator
+from opencode_agent.scanner.orchestrator import OpenCodeOrchestrator
 
 TEST_DIR = Path("/home/atituiset/Projects/opencode-c-cpp-test")
 
