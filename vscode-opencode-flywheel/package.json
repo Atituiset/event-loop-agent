@@ -1,0 +1,98 @@
+{
+  "name": "opencode-flywheel",
+  "displayName": "OpenCode Data Flywheel",
+  "description": "Visualize OpenCode scan findings and label true/false positives",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Machine Learning",
+    "Debuggers"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "views": {
+      "explorer": [
+        {
+          "id": "opencodeFindings",
+          "name": "OpenCode Findings",
+          "when": "opencode.hasFindings"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "opencode.refreshFindings",
+        "title": "Refresh OpenCode Findings",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "opencode.openFindingDetail",
+        "title": "Open Finding Detail"
+      },
+      {
+        "command": "opencode.labelTruePositive",
+        "title": "Mark as True Positive",
+        "icon": "$(check)"
+      },
+      {
+        "command": "opencode.labelFalsePositive",
+        "title": "Mark as False Positive",
+        "icon": "$(x)"
+      }
+    ],
+    "menus": {
+      "view/item/context": [
+        {
+          "command": "opencode.labelTruePositive",
+          "when": "view == opencodeFindings && viewItem == finding",
+          "group": "inline@1"
+        },
+        {
+          "command": "opencode.labelFalsePositive",
+          "when": "view == opencodeFindings && viewItem == finding",
+          "group": "inline@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "OpenCode Flywheel",
+      "properties": {
+        "opencode.apiBaseUrl": {
+          "type": "string",
+          "default": "http://localhost:8080",
+          "description": "Base URL of the OpenCode feedback API server"
+        },
+        "opencode.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for the OpenCode feedback API (optional)"
+        },
+        "opencode.autoLoadFindings": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically load findings when a scan completes"
+        },
+        "opencode.showLabeledFindings": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show findings that have already been labeled"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.5.0"
+  }
+}

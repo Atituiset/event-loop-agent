@@ -51,6 +51,7 @@ nga 交互方式:
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import re
@@ -340,6 +341,7 @@ class OpenCodeOrchestrator:
         debug: bool = False,
         web_port: int = 8080,
         workspace: str = "",
+        output_json: bool = False,
     ):
         self.concurrency = concurrency
         self.nga_bin = nga_bin
@@ -347,10 +349,12 @@ class OpenCodeOrchestrator:
         self.debug = debug
         self.web_port = web_port
         self.workspace = workspace
+        self.output_json = output_json
 
         self.tasks: list[ScanTask] = []
         self.semaphore = asyncio.Semaphore(concurrency)
         self._file_locks: dict[str, asyncio.Lock] = {}  # 文件级锁：同文件内函数串行执行
+        self._function_cache: dict[str, list] = {}  # tree-sitter 解析结果缓存
         self._shutdown = False
 
         # 检查 ngaent 清理命令是否可用（用于清理 nga 残留的并发锁文件）
@@ -378,6 +382,19 @@ class OpenCodeOrchestrator:
             self.output_dir = Path("reports") / datetime.now().strftime("%Y%m%d_%H%M%S")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Output directory: {self.output_dir}")
+
+        # 结构化 finding 输出与存储（数据飞轮）
+        self.repo_url: str = ""
+        self.finding_store: Optional["FindingStore"] = None  # type: ignore
+        if self.output_json:
+            try:
+                from finding_store import FindingStore
+
+                db_path = self.output_dir / "findings.db"
+                self.finding_store = FindingStore(str(db_path))
+                logger.info(f"Finding store initialized: {db_path}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize finding store: {e}")
 
         # diff 文件单独存放
         self.diff_dir = self.output_dir / "diffs"
@@ -415,11 +432,17 @@ class OpenCodeOrchestrator:
             "--access-logfile", "-",
         ]
         logger.info(f"Starting web debug server: http://localhost:{self.web_port}")
+
+        env = os.environ.copy()
+        if self.finding_store is not None:
+            env["OPENCODE_FINDINGS_DB"] = str(self.finding_store.db_path)
+
         self.web_proc = subprocess.Popen(
             web_cmd,
             cwd=str(script_dir),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
         )
 
         # 等待 web server 就绪（轮询 / 最多 5 秒）
@@ -561,6 +584,24 @@ class OpenCodeOrchestrator:
     #  任务初始化
     # ------------------------------------------------------------------
 
+    def _detect_repo_url(self, repo_path: Path | str = ".") -> str:
+        """尝试通过 git remote 获取仓库 URL，用于生成稳定 finding ID。"""
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception:
+            pass
+        return ""
+
     def setup_file_mode(self, file_paths: list[str], cared_paths: Optional[list[str]] = None):
         """文件列表模式
 
@@ -568,6 +609,7 @@ class OpenCodeOrchestrator:
         - 如果传入的是目录，递归扫描目录下的 C/C++ 文件
         - 路径统一用相对路径（相对于当前工作目录）
         """
+        self.repo_url = self._detect_repo_url(".")
         all_files: list[str] = []
         c_extensions = (".c", ".cc", ".cpp", ".h", ".hpp")
         cwd = Path.cwd()
@@ -602,6 +644,7 @@ class OpenCodeOrchestrator:
         repo = Path(repo_path).resolve()
         self.repo_path = repo
         self.start_commit = start_commit
+        self.repo_url = self._detect_repo_url(repo)
         logger.info(f"Diff mode: repo={repo}, start_commit={start_commit}")
 
         changed_files = self._get_changed_files(repo, start_commit)
@@ -649,6 +692,7 @@ class OpenCodeOrchestrator:
         - 每个函数创建一个独立 ScanTask
         - tree-sitter 解析失败时降级为整文件扫描
         """
+        self.repo_url = self._detect_repo_url(".")
         from function_splitter import extract_functions
 
         all_files: list[str] = []
@@ -719,7 +763,11 @@ class OpenCodeOrchestrator:
         func_idx = 0
         for fp in all_files:
             try:
-                functions = extract_functions(fp)
+                if fp in self._function_cache:
+                    functions = self._function_cache[fp]
+                else:
+                    functions = extract_functions(fp)
+                    self._function_cache[fp] = functions
             except Exception as e:
                 logger.warning(f"[{fp}] tree-sitter parse failed: {e}, falling back to whole-file scan")
                 file_idx += 1
@@ -859,12 +907,72 @@ class OpenCodeOrchestrator:
         )
         return message
 
+    def _filter_known_false_positives(self, findings: list["Finding"]) -> list["Finding"]:
+        """移除数据库中已被标记为 false_positive 的 finding。"""
+        if not self.finding_store:
+            return findings
+
+        filtered = []
+        for finding in findings:
+            stored = self.finding_store.get_finding(finding.finding_id)
+            if stored and stored.label == "false_positive":
+                logger.info(
+                    f"[memory] Suppressing known false positive {finding.finding_id} "
+                    f"({finding.rule_id} @ {finding.file_path})"
+                )
+                continue
+            filtered.append(finding)
+        return filtered
+
+    def _build_memory_section(self, file_path: str, function_name: str = "") -> str:
+        """从历史反馈中构建 prompt 记忆段落，引导 nga 避免重复误报。"""
+        if not self.finding_store:
+            return ""
+
+        try:
+            labels = self.finding_store.get_historical_labels(file_path, function_name)
+            if not labels:
+                return ""
+
+            false_positives: list[str] = []
+            true_positives: list[str] = []
+
+            for finding_id, label in labels.items():
+                finding = self.finding_store.get_finding(finding_id)
+                if not finding:
+                    continue
+                summary = f"- {finding.rule_id}: {finding.description[:80]}..."
+                if label == "false_positive":
+                    false_positives.append(summary)
+                elif label == "true_positive":
+                    true_positives.append(summary)
+
+            lines = ["\n=== 历史审查记忆（开发者标注） ==="]
+            if false_positives:
+                lines.append("以下模式已被开发者标记为误报，请避免重复报告：")
+                lines.extend(false_positives)
+                lines.append("")
+            if true_positives:
+                lines.append("以下模式已被开发者确认为真实问题，请保持关注：")
+                lines.extend(true_positives)
+                lines.append("")
+            lines.append("=====================================\n")
+
+            return "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"Failed to build memory section: {e}")
+            return ""
+
     def _build_full_scan_cmd(self, task: ScanTask) -> str:
         """Full 模式下构造审查提示词，包含函数代码和 AST 元数据"""
         from function_splitter import extract_functions
 
         try:
-            functions = extract_functions(task.file_path)
+            if task.file_path in self._function_cache:
+                functions = self._function_cache[task.file_path]
+            else:
+                functions = extract_functions(task.file_path)
+                self._function_cache[task.file_path] = functions
             func = next((f for f in functions if f.name == task.function_name), None)
             if func is None:
                 logger.warning(f"[{task.task_id}] Function {task.function_name} not found, falling back to file review")
@@ -903,6 +1011,13 @@ class OpenCodeOrchestrator:
             f"```c\n"
             f"{func.code_text}\n"
             f"```\n\n"
+        )
+
+        # 注入历史审查记忆
+        if self.finding_store:
+            message += self._build_memory_section(task.file_path, task.function_name)
+
+        message += (
             f"审查要求：\n"
             f"1. 检查函数内所有变量的定义和声明，是否存在未初始化使用\n"
             f"2. 检查内存操作（malloc/free、memcpy 等）是否存在泄漏或越界\n"
@@ -1024,8 +1139,12 @@ class OpenCodeOrchestrator:
                     if task.function_name:
                         # Full 模式：按函数代码行数估算
                         try:
-                            from function_splitter import extract_functions
-                            functions = extract_functions(task.file_path)
+                            if task.file_path in self._function_cache:
+                                functions = self._function_cache[task.file_path]
+                            else:
+                                from function_splitter import extract_functions
+                                functions = extract_functions(task.file_path)
+                                self._function_cache[task.file_path] = functions
                             func = next((f for f in functions if f.name == task.function_name), None)
                             func_lines = len(func.code_text.splitlines()) if func else 50
                         except Exception:
@@ -1199,6 +1318,33 @@ class OpenCodeOrchestrator:
                     Path(task.report_file).write_text(report_md, encoding="utf-8")
                     logger.debug(f"[{task.task_id}] Report saved: {task.report_file}")
 
+                    # 7.5 生成结构化 finding 输出（数据飞轮）
+                    if self.output_json and task.status == "done":
+                        try:
+                            from finding_parser import parse_findings_from_markdown
+
+                            findings = parse_findings_from_markdown(
+                                task.stdout,
+                                repo_url=self.repo_url,
+                                function_name=task.function_name,
+                                task_id=task.task_id,
+                                file_path=task.file_path,
+                            )
+                            findings = self._filter_known_false_positives(findings)
+                            if findings:
+                                findings_json_path = Path(task.report_file).with_suffix(".findings.json")
+                                findings_json_path.parent.mkdir(parents=True, exist_ok=True)
+                                findings_json_path.write_text(
+                                    json.dumps([f.to_dict() for f in findings], indent=2, ensure_ascii=False),
+                                    encoding="utf-8",
+                                )
+                                logger.debug(f"[{task.task_id}] Findings JSON saved: {findings_json_path}")
+
+                                if self.finding_store:
+                                    self.finding_store.save_findings(findings)
+                        except Exception as e:
+                            logger.warning(f"[{task.task_id}] Failed to parse findings: {e}")
+
                     # 追加尾部统计到 .log 文件并关闭
                     log_fh.write("\n=== End ===\n")
                     log_fh.write(f"Status: {task.status}\n")
@@ -1370,6 +1516,11 @@ def main():
         default="",
         help="nga 工作目录，传给 --dir 参数（默认使用被扫描文件所在目录）",
     )
+    parser.add_argument(
+        "--output-json",
+        action="store_true",
+        help="同时输出结构化的 findings.json 并写入 findings.db（数据飞轮）",
+    )
 
     args = parser.parse_args()
 
@@ -1381,6 +1532,7 @@ def main():
         debug=args.debug,
         web_port=args.web_port,
         workspace=args.workspace,
+        output_json=args.output_json,
     )
 
     # 解析 cared_paths

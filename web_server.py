@@ -11,10 +11,12 @@ Launched by orchestrator.py when --debug is enabled (via gunicorn).
 
 import asyncio
 import json
-from typing import Optional
+import os
+from typing import Any, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel
 
 app = FastAPI(title="OpenCode Orchestrator Debug")
 
@@ -113,6 +115,126 @@ async def sse_stream(slot_id: int):
             "Connection": "keep-alive",
         },
     )
+
+
+# =============================================================================
+# Finding Feedback API (Data Flywheel)
+# =============================================================================
+
+class LabelRequest(BaseModel):
+    label: str  # "true_positive" | "false_positive"
+    reason: str = ""
+    labeled_by: str = ""
+
+
+class FindingResponse(BaseModel):
+    finding_id: str
+    file_path: str
+    line_number: int
+    rule_id: str
+    severity: str
+    description: str
+    code_snippet: str
+    suggestion: str
+    confidence: float
+    function_name: str = ""
+    scan_timestamp: str = ""
+    label: Optional[str] = None
+    label_reason: Optional[str] = None
+
+
+_finding_store: Optional["FindingStore"] = None  # type: ignore
+
+
+def _get_finding_store() -> Optional["FindingStore"]:
+    """Lazy initialize FindingStore from environment variable."""
+    global _finding_store
+    if _finding_store is not None:
+        return _finding_store
+
+    db_path = os.environ.get("OPENCODE_FINDINGS_DB")
+    if not db_path:
+        return None
+
+    try:
+        from finding_store import FindingStore
+
+        _finding_store = FindingStore(db_path)
+        return _finding_store
+    except Exception as e:
+        import logging
+
+        logging.getLogger("web_server").warning(f"Failed to load finding store: {e}")
+        return None
+
+
+def _finding_to_response(finding: "Finding") -> dict[str, Any]:
+    return finding.to_dict()
+
+
+@app.get("/api/findings")
+async def api_get_findings(
+    file_path: Optional[str] = None,
+    function_name: Optional[str] = None,
+    rule_id: Optional[str] = None,
+):
+    """Get findings, optionally filtered by file, function, or rule."""
+    store = _get_finding_store()
+    if store is None:
+        return []
+
+    findings = store.get_findings_for_file(file_path or "", function_name or None)
+    if rule_id:
+        findings = [f for f in findings if f.rule_id == rule_id]
+    return [_finding_to_response(f) for f in findings]
+
+
+@app.get("/api/findings/{finding_id}")
+async def api_get_finding(finding_id: str):
+    """Get a single finding by ID."""
+    store = _get_finding_store()
+    if store is None:
+        raise HTTPException(status_code=503, detail="Finding store not configured")
+
+    finding = store.get_finding(finding_id)
+    if finding is None:
+        raise HTTPException(status_code=404, detail="Finding not found")
+    return _finding_to_response(finding)
+
+
+@app.post("/api/findings/{finding_id}/label")
+async def api_label_finding(finding_id: str, req: LabelRequest):
+    """Label a finding as true_positive or false_positive."""
+    store = _get_finding_store()
+    if store is None:
+        raise HTTPException(status_code=503, detail="Finding store not configured")
+
+    if req.label not in ("true_positive", "false_positive"):
+        raise HTTPException(
+            status_code=400,
+            detail="label must be 'true_positive' or 'false_positive'",
+        )
+
+    finding = store.get_finding(finding_id)
+    if finding is None:
+        raise HTTPException(status_code=404, detail="Finding not found")
+
+    store.update_label(
+        finding_id,
+        label=req.label,
+        labeled_by=req.labeled_by,
+        label_reason=req.reason,
+    )
+    return {"ok": True, "finding_id": finding_id, "label": req.label}
+
+
+@app.get("/api/stats")
+async def api_get_stats():
+    """Return feedback statistics."""
+    store = _get_finding_store()
+    if store is None:
+        return {"total_findings": 0, "true_positives": 0, "false_positives": 0, "unlabeled": 0}
+    return store.get_feedback_stats()
 
 
 # =============================================================================
