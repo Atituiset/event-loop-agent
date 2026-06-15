@@ -1,15 +1,49 @@
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { ApiClient } from './apiClient';
 import { FindingPanel } from './findingPanel';
+import { SessionManager } from './sessionManager';
+import { SummaryPanel } from './summaryPanel';
 import { FindingNode, FindingsTreeProvider } from './treeProvider';
 
 export function registerCommands(
     context: vscode.ExtensionContext,
     treeProvider: FindingsTreeProvider,
 ): void {
+    const sessionManager = new SessionManager();
+
     context.subscriptions.push(
         vscode.commands.registerCommand('opencode.refreshFindings', () => {
             treeProvider.loadFindings();
+        }),
+
+        vscode.commands.registerCommand('opencode.selectSession', async () => {
+            const session = await sessionManager.selectSession();
+            if (session) {
+                treeProvider.setDbPath(session.dbPath);
+                await treeProvider.loadFindings();
+                vscode.window.showInformationMessage(`OpenCode: loaded ${session.label}`);
+            }
+        }),
+
+        vscode.commands.registerCommand('opencode.openSummary', () => {
+            SummaryPanel.show(treeProvider.getFindings(), treeProvider.getStats());
+        }),
+
+        vscode.commands.registerCommand('opencode.openLogFile', async () => {
+            const dbPath = treeProvider.getDbPath();
+            if (!dbPath) {
+                vscode.window.showWarningMessage('No active OpenCode scan session');
+                return;
+            }
+            const logPath = path.join(path.dirname(dbPath), 'orchestrator.log');
+            const logUri = vscode.Uri.file(logPath);
+            try {
+                const doc = await vscode.workspace.openTextDocument(logUri);
+                await vscode.window.showTextDocument(doc);
+            } catch {
+                vscode.window.showErrorMessage(`Could not open log file: ${logPath}`);
+            }
         }),
 
         vscode.commands.registerCommand('opencode.openFindingDetail', (nodeOrFinding) => {
@@ -44,10 +78,10 @@ async function labelFinding(
         placeHolder: 'e.g. this pattern is intentional here',
     });
 
-    // User cancelled
     if (reason === undefined) { return; }
 
     const apiClient = new ApiClient();
+    apiClient.setDbPath(treeProvider.getDbPath());
     try {
         await apiClient.labelFinding(node.finding.finding_id, label, reason);
         vscode.window.showInformationMessage(`Marked ${node.finding.rule_id} as ${label.replace('_', ' ')}`);

@@ -1,8 +1,9 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { ApiClient, Finding } from './apiClient';
+import { ApiClient, FeedbackStats, Finding } from './apiClient';
+import { SummaryPanel } from './summaryPanel';
 
-export type FindingNodeType = 'root' | 'file' | 'function' | 'finding';
+export type FindingNodeType = 'root' | 'summary' | 'file' | 'function' | 'finding';
 
 export class FindingNode extends vscode.TreeItem {
     constructor(
@@ -18,7 +19,7 @@ export class FindingNode extends vscode.TreeItem {
 
         if (type === 'finding' && finding) {
             this.contextValue = 'finding';
-            this.tooltip = `${finding.rule_id}: ${finding.description}`;
+            this.tooltip = `${finding.file_path}:${finding.line_number}\n${finding.rule_id}: ${finding.description}`;
             this.description = `line ${finding.line_number}`;
             this.iconPath = this.getSeverityIcon(finding.severity, finding.label);
             this.command = {
@@ -29,9 +30,17 @@ export class FindingNode extends vscode.TreeItem {
         } else if (type === 'file') {
             this.iconPath = vscode.ThemeIcon.File;
             this.contextValue = 'file';
+            this.tooltip = finding?.file_path || label;
         } else if (type === 'function') {
             this.iconPath = new vscode.ThemeIcon('symbol-method');
             this.contextValue = 'function';
+        } else if (type === 'summary') {
+            this.iconPath = new vscode.ThemeIcon('dashboard');
+            this.contextValue = 'summary';
+            this.command = {
+                command: 'opencode.openSummary',
+                title: 'Open Scan Summary',
+            };
         } else {
             this.iconPath = new vscode.ThemeIcon('search');
         }
@@ -41,8 +50,6 @@ export class FindingNode extends vscode.TreeItem {
         severity: string,
         label?: string | null,
     ): vscode.ThemeIcon {
-        // Overlay status via icon modifier is not directly supported, so we pick
-        // a severity color and rely on the detail panel to show labeled state.
         switch (severity.toUpperCase()) {
             case 'CRITICAL':
                 return new vscode.ThemeIcon('error');
@@ -66,9 +73,26 @@ export class FindingsTreeProvider implements vscode.TreeDataProvider<FindingNode
 
     private apiClient: ApiClient;
     private findings: Finding[] = [];
+    private stats: FeedbackStats = { total_findings: 0, true_positives: 0, false_positives: 0, unlabeled: 0 };
 
     constructor() {
         this.apiClient = new ApiClient();
+    }
+
+    setDbPath(dbPath: string | undefined): void {
+        this.apiClient.setDbPath(dbPath);
+    }
+
+    getDbPath(): string | undefined {
+        return this.apiClient.getDbPath();
+    }
+
+    getFindings(): Finding[] {
+        return this.findings;
+    }
+
+    getStats(): FeedbackStats {
+        return this.stats;
     }
 
     refresh(): void {
@@ -77,7 +101,10 @@ export class FindingsTreeProvider implements vscode.TreeDataProvider<FindingNode
 
     async loadFindings(): Promise<void> {
         try {
-            this.findings = await this.apiClient.getFindings();
+            [this.findings, this.stats] = await Promise.all([
+                this.apiClient.getFindings(),
+                this.apiClient.getStats(),
+            ]);
             vscode.commands.executeCommand('setContext', 'opencode.hasFindings', this.findings.length > 0);
             this.refresh();
         } catch (err) {
@@ -100,6 +127,14 @@ export class FindingsTreeProvider implements vscode.TreeDataProvider<FindingNode
         const showLabeled = vscode.workspace.getConfiguration('opencode').get<boolean>('showLabeledFindings') || false;
         const visible = showLabeled ? this.findings : this.findings.filter((f) => !f.label);
 
+        // Summary node
+        const summaryNode = new FindingNode(
+            'summary',
+            `Summary: ${this.stats.total_findings} total, ${this.stats.unlabeled} unlabeled`,
+            undefined,
+            [],
+        );
+
         // Group by file_path -> function_name -> findings
         const fileMap = new Map<string, Map<string, Finding[]>>();
         for (const finding of visible) {
@@ -115,16 +150,27 @@ export class FindingsTreeProvider implements vscode.TreeDataProvider<FindingNode
             funcMap.get(func)!.push(finding);
         }
 
-        const rootNodes: FindingNode[] = [];
+        const rootNodes: FindingNode[] = [summaryNode];
         for (const [filePath, funcMap] of fileMap.entries()) {
+            const fileFindings = Array.from(funcMap.values()).flat();
+            const fileCount = fileFindings.length;
             const funcNodes: FindingNode[] = [];
+
             for (const [funcName, funcFindings] of funcMap.entries()) {
+                const lines = funcFindings.map((f) => f.line_number).filter((n) => n > 0);
+                const lineRange = lines.length > 0
+                    ? `${Math.min(...lines)}-${Math.max(...lines)}`
+                    : '-';
+                const funcLabel = `${funcName} @ ${path.basename(filePath)}:${lineRange} (${funcFindings.length})`;
+
                 const findingNodes = funcFindings.map(
-                    (f) => new FindingNode('finding', `${f.rule_id}: ${this.truncate(f.description, 40)}`, f),
+                    (f) => new FindingNode('finding', `${f.rule_id} @ L${f.line_number}: ${this.truncate(f.description, 35)}`, f),
                 );
-                funcNodes.push(new FindingNode('function', funcName, undefined, findingNodes));
+                funcNodes.push(new FindingNode('function', funcLabel, undefined, findingNodes));
             }
-            rootNodes.push(new FindingNode('file', path.basename(filePath), undefined, funcNodes));
+
+            const fileLabel = `${filePath} (${fileCount})`;
+            rootNodes.push(new FindingNode('file', fileLabel, fileFindings[0], funcNodes));
         }
 
         return rootNodes;
@@ -135,7 +181,6 @@ export class FindingsTreeProvider implements vscode.TreeDataProvider<FindingNode
     }
 
     async updateFindingLabel(findingId: string): Promise<void> {
-        // Refresh single finding state from server
         try {
             const updated = await this.apiClient.getFinding(findingId);
             const idx = this.findings.findIndex((f) => f.finding_id === findingId);
