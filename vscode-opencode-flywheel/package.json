@@ -16,11 +16,20 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "opencodeFlywheel",
+          "title": "OpenCode",
+          "icon": "$(bug)"
+        }
+      ]
+    },
     "views": {
-      "explorer": [
+      "opencodeFlywheel": [
         {
           "id": "opencodeFindings",
-          "name": "OpenCode Findings"
+          "name": "Findings"
         }
       ]
     },
