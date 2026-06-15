@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from finding_parser import Finding, generate_finding_id
-from finding_store import FindingStore
+from opencode_agent.findings.parser import Finding, generate_finding_id
+from opencode_agent.findings.store import FindingStore
 
 
 def test_init_creates_database():

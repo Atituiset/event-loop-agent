@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from finding_parser import (
+from opencode_agent.findings.parser import (
     Finding,
     generate_finding_id,
     normalize_snippet,

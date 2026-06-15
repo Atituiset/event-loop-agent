@@ -3,8 +3,8 @@
 import tempfile
 from pathlib import Path
 
-from finding_parser import Finding, generate_finding_id
-from finding_store import FindingStore
+from opencode_agent.findings.parser import Finding, generate_finding_id
+from opencode_agent.findings.store import FindingStore
 
 
 class FakeOrchestrator:
