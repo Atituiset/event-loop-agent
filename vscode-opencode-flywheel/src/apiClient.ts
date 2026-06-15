@@ -26,11 +26,31 @@ export interface FeedbackStats {
 export class ApiClient {
     private baseUrl: string;
     private apiKey: string;
+    private dbPath: string | undefined;
 
     constructor() {
         const config = vscode.workspace.getConfiguration('opencode');
         this.baseUrl = config.get<string>('apiBaseUrl') || 'http://localhost:8080';
         this.apiKey = config.get<string>('apiKey') || '';
+        this.dbPath = config.get<string>('activeDbPath') || undefined;
+    }
+
+    setDbPath(dbPath: string | undefined): void {
+        this.dbPath = dbPath;
+        vscode.workspace.getConfiguration('opencode').update('activeDbPath', dbPath, true);
+    }
+
+    getDbPath(): string | undefined {
+        return this.dbPath;
+    }
+
+    private buildPath(path: string): string {
+        const params = new URLSearchParams();
+        if (this.dbPath) {
+            params.set('db_path', this.dbPath);
+        }
+        const query = params.toString();
+        return query ? `${path}?${query}` : path;
     }
 
     private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -42,7 +62,7 @@ export class ApiClient {
             headers['X-API-Key'] = this.apiKey;
         }
 
-        const url = `${this.baseUrl}${path}`;
+        const url = `${this.baseUrl}${this.buildPath(path)}`;
         const response = await fetch(url, { ...options, headers });
         if (!response.ok) {
             const text = await response.text();
@@ -81,7 +101,6 @@ export class ApiClient {
 
     private async getUserIdentifier(): Promise<string> {
         try {
-            // Best-effort user identity from Git config
             const { exec } = await import('child_process');
             const { promisify } = await import('util');
             const execAsync = promisify(exec);

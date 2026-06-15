@@ -21,7 +21,7 @@
         {
           "id": "opencodeFlywheel",
           "title": "OpenCode",
-          "icon": "$(bug)"
+          "icon": "$(comment-discussion)"
         }
       ]
     },
@@ -40,6 +40,18 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "opencode.selectSession",
+        "title": "Select OpenCode Scan Session"
+      },
+      {
+        "command": "opencode.openSummary",
+        "title": "Open Scan Summary"
+      },
+      {
+        "command": "opencode.openLogFile",
+        "title": "Open Scan Log"
+      },
+      {
         "command": "opencode.openFindingDetail",
         "title": "Open Finding Detail"
       },
@@ -55,6 +67,23 @@
       }
     ],
     "menus": {
+      "view/title": [
+        {
+          "command": "opencode.selectSession",
+          "when": "view == opencodeFindings",
+          "group": "navigation@1"
+        },
+        {
+          "command": "opencode.refreshFindings",
+          "when": "view == opencodeFindings",
+          "group": "navigation@2"
+        },
+        {
+          "command": "opencode.openLogFile",
+          "when": "view == opencodeFindings",
+          "group": "navigation@3"
+        }
+      ],
       "view/item/context": [
         {
           "command": "opencode.labelTruePositive",
@@ -90,6 +119,11 @@
           "type": "boolean",
           "default": false,
           "description": "Show findings that have already been labeled"
+        },
+        "opencode.activeDbPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the active findings.db file"
         }
       }
     }

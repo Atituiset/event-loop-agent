@@ -24,10 +24,11 @@ def test_api_returns_empty_when_no_store(client):
     # Ensure env var is not set
     old_db = os.environ.pop("OPENCODE_FINDINGS_DB", None)
     try:
-        # Reset lazy singleton
+        # Reset store cache
         import web_server
 
-        web_server._finding_store = None
+        web_server._finding_stores = {}
+        web_server._default_db_path = None
 
         resp = client.get("/api/findings")
         assert resp.status_code == 200
@@ -56,11 +57,11 @@ def test_api_get_findings_with_store(client):
             )
         ])
 
-        # Reset lazy singleton and set env var
+        # Reset store cache and set env var
         import web_server
 
-        web_server._finding_store = None
-        os.environ["OPENCODE_FINDINGS_DB"] = str(db_path)
+        web_server._finding_stores = {}
+        web_server._default_db_path = str(db_path)
 
         try:
             resp = client.get("/api/findings?file_path=src/main.c")
@@ -69,7 +70,7 @@ def test_api_get_findings_with_store(client):
             assert len(data) == 1
             assert data[0]["finding_id"] == "f1"
         finally:
-            web_server._finding_store = None
+            web_server._finding_stores = {}
 
 
 def test_api_label_finding(client):
@@ -92,8 +93,8 @@ def test_api_label_finding(client):
 
         import web_server
 
-        web_server._finding_store = None
-        os.environ["OPENCODE_FINDINGS_DB"] = str(db_path)
+        web_server._finding_stores = {}
+        web_server._default_db_path = str(db_path)
 
         try:
             resp = client.post(
@@ -108,7 +109,7 @@ def test_api_label_finding(client):
             assert finding.label_reason == "Not a bug"
             assert finding.labeled_by == "dev"
         finally:
-            web_server._finding_store = None
+            web_server._finding_stores = {}
 
 
 def test_api_label_finding_invalid_label(client):
@@ -131,8 +132,8 @@ def test_api_label_finding_invalid_label(client):
 
         import web_server
 
-        web_server._finding_store = None
-        os.environ["OPENCODE_FINDINGS_DB"] = str(db_path)
+        web_server._finding_stores = {}
+        web_server._default_db_path = str(db_path)
 
         try:
             resp = client.post(
@@ -141,4 +142,4 @@ def test_api_label_finding_invalid_label(client):
             )
             assert resp.status_code == 400
         finally:
-            web_server._finding_store = None
+            web_server._finding_stores = {}

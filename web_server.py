@@ -143,28 +143,29 @@ class FindingResponse(BaseModel):
     label_reason: Optional[str] = None
 
 
-_finding_store: Optional["FindingStore"] = None  # type: ignore
+_finding_stores: dict[str, "FindingStore"] = {}  # cache by db_path
+_default_db_path: Optional[str] = os.environ.get("OPENCODE_FINDINGS_DB")
 
 
-def _get_finding_store() -> Optional["FindingStore"]:
-    """Lazy initialize FindingStore from environment variable."""
-    global _finding_store
-    if _finding_store is not None:
-        return _finding_store
-
-    db_path = os.environ.get("OPENCODE_FINDINGS_DB")
-    if not db_path:
+def _get_finding_store(db_path: Optional[str] = None) -> Optional["FindingStore"]:
+    """Get or create FindingStore for the given db path (or default env var)."""
+    target = db_path or _default_db_path
+    if not target:
         return None
+
+    if target in _finding_stores:
+        return _finding_stores[target]
 
     try:
         from finding_store import FindingStore
 
-        _finding_store = FindingStore(db_path)
-        return _finding_store
+        store = FindingStore(target)
+        _finding_stores[target] = store
+        return store
     except Exception as e:
         import logging
 
-        logging.getLogger("web_server").warning(f"Failed to load finding store: {e}")
+        logging.getLogger("web_server").warning(f"Failed to load finding store {target}: {e}")
         return None
 
 
@@ -174,12 +175,13 @@ def _finding_to_response(finding: "Finding") -> dict[str, Any]:
 
 @app.get("/api/findings")
 async def api_get_findings(
+    db_path: Optional[str] = None,
     file_path: Optional[str] = None,
     function_name: Optional[str] = None,
     rule_id: Optional[str] = None,
 ):
     """Get findings, optionally filtered by file, function, or rule."""
-    store = _get_finding_store()
+    store = _get_finding_store(db_path)
     if store is None:
         return []
 
@@ -196,9 +198,9 @@ async def api_get_findings(
 
 
 @app.get("/api/findings/{finding_id}")
-async def api_get_finding(finding_id: str):
+async def api_get_finding(finding_id: str, db_path: Optional[str] = None):
     """Get a single finding by ID."""
-    store = _get_finding_store()
+    store = _get_finding_store(db_path)
     if store is None:
         raise HTTPException(status_code=503, detail="Finding store not configured")
 
@@ -209,9 +211,13 @@ async def api_get_finding(finding_id: str):
 
 
 @app.post("/api/findings/{finding_id}/label")
-async def api_label_finding(finding_id: str, req: LabelRequest):
+async def api_label_finding(
+    finding_id: str,
+    req: LabelRequest,
+    db_path: Optional[str] = None,
+):
     """Label a finding as true_positive or false_positive."""
-    store = _get_finding_store()
+    store = _get_finding_store(db_path)
     if store is None:
         raise HTTPException(status_code=503, detail="Finding store not configured")
 
@@ -235,9 +241,9 @@ async def api_label_finding(finding_id: str, req: LabelRequest):
 
 
 @app.get("/api/stats")
-async def api_get_stats():
+async def api_get_stats(db_path: Optional[str] = None):
     """Return feedback statistics."""
-    store = _get_finding_store()
+    store = _get_finding_store(db_path)
     if store is None:
         return {"total_findings": 0, "true_positives": 0, "false_positives": 0, "unlabeled": 0}
     return store.get_feedback_stats()
