@@ -7,11 +7,11 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from finding_parser import Finding
-from finding_store import FindingStore
+from opencode_agent.findings.parser import Finding
+from opencode_agent.findings.store import FindingStore
 
 # Import web_server after setting env var if needed
-from web_server import app
+from opencode_agent.web.server import app
 
 
 @pytest.fixture
@@ -25,7 +25,7 @@ def test_api_returns_empty_when_no_store(client):
     old_db = os.environ.pop("OPENCODE_FINDINGS_DB", None)
     try:
         # Reset store cache
-        import web_server
+        import opencode_agent.web.server as web_server
 
         web_server._finding_stores = {}
         web_server._default_db_path = None
@@ -58,7 +58,7 @@ def test_api_get_findings_with_store(client):
         ])
 
         # Reset store cache and set env var
-        import web_server
+        import opencode_agent.web.server as web_server
 
         web_server._finding_stores = {}
         web_server._default_db_path = str(db_path)
@@ -91,7 +91,7 @@ def test_api_label_finding(client):
             )
         ])
 
-        import web_server
+        import opencode_agent.web.server as web_server
 
         web_server._finding_stores = {}
         web_server._default_db_path = str(db_path)
@@ -130,7 +130,7 @@ def test_api_label_finding_invalid_label(client):
             )
         ])
 
-        import web_server
+        import opencode_agent.web.server as web_server
 
         web_server._finding_stores = {}
         web_server._default_db_path = str(db_path)
