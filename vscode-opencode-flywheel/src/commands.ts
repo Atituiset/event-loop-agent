@@ -37,6 +37,12 @@ export function registerCommands(
                 return;
             }
             const logPath = path.join(path.dirname(dbPath), 'orchestrator.log');
+            if (!require('fs').existsSync(logPath)) {
+                vscode.window.showWarningMessage(
+                    `No orchestrator.log found for this session. It may be a demo/converted session without original runtime logs.`
+                );
+                return;
+            }
             const logUri = vscode.Uri.file(logPath);
             try {
                 const doc = await vscode.workspace.openTextDocument(logUri);
