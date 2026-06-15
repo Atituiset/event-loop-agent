@@ -117,6 +117,13 @@ class FindingStore:
             ).fetchone()
             return self._row_to_finding(row) if row else None
 
+    def get_all_findings(self) -> list[Finding]:
+        """Get all findings in the store."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM findings").fetchall()
+            return [self._row_to_finding(r) for r in rows]
+
     def get_findings_for_file(
         self,
         file_path: str,

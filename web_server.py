@@ -183,7 +183,13 @@ async def api_get_findings(
     if store is None:
         return []
 
-    findings = store.get_findings_for_file(file_path or "", function_name or None)
+    if file_path:
+        findings = store.get_findings_for_file(file_path, function_name or None)
+    else:
+        findings = store.get_all_findings()
+        if function_name:
+            findings = [f for f in findings if f.function_name == function_name]
+
     if rule_id:
         findings = [f for f in findings if f.rule_id == rule_id]
     return [_finding_to_response(f) for f in findings]
