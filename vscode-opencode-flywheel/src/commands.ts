@@ -52,6 +52,20 @@ export function registerCommands(
             }
         }),
 
+        vscode.commands.registerCommand('opencode.openFileLog', async (logPath: string) => {
+            if (!logPath) {
+                vscode.window.showWarningMessage('No log file available for this item');
+                return;
+            }
+            const logUri = vscode.Uri.file(logPath);
+            try {
+                const doc = await vscode.workspace.openTextDocument(logUri);
+                await vscode.window.showTextDocument(doc);
+            } catch {
+                vscode.window.showErrorMessage(`Could not open log file: ${logPath}`);
+            }
+        }),
+
         vscode.commands.registerCommand('opencode.openFindingDetail', (nodeOrFinding) => {
             const finding = nodeOrFinding instanceof FindingNode ? nodeOrFinding.finding : nodeOrFinding;
             if (finding) {

@@ -1330,6 +1330,8 @@ class OpenCodeOrchestrator:
                                 task_id=task.task_id,
                                 file_path=task.file_path,
                             )
+                            for finding in findings:
+                                finding.log_file = task.log_file
                             findings = self._filter_known_false_positives(findings)
                             if findings:
                                 findings_json_path = Path(task.report_file).with_suffix(".findings.json")

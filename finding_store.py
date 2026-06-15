@@ -42,6 +42,7 @@ class FindingStore:
                     scan_timestamp TEXT,
                     mr_link TEXT,
                     task_id TEXT,
+                    log_file TEXT,
                     label TEXT,
                     labeled_by TEXT,
                     labeled_at TEXT,
@@ -104,7 +105,8 @@ class FindingStore:
                         function_name=excluded.function_name,
                         scan_timestamp=excluded.scan_timestamp,
                         mr_link=excluded.mr_link,
-                        task_id=excluded.task_id
+                        task_id=excluded.task_id,
+                        log_file=excluded.log_file
                 """
                 conn.execute(sql, data)
 
