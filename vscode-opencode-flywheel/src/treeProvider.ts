@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import { ApiClient, FeedbackStats, Finding } from './apiClient';
 import { SummaryPanel } from './summaryPanel';
 
-export type FindingNodeType = 'root' | 'summary' | 'file' | 'function' | 'finding';
+export type FindingNodeType = 'root' | 'summary' | 'log' | 'file' | 'function' | 'finding';
 
 export class FindingNode extends vscode.TreeItem {
     constructor(
@@ -41,6 +41,9 @@ export class FindingNode extends vscode.TreeItem {
                 command: 'opencode.openSummary',
                 title: 'Open Scan Summary',
             };
+        } else if (type === 'log') {
+            this.iconPath = new vscode.ThemeIcon('output');
+            this.contextValue = 'log';
         } else {
             this.iconPath = new vscode.ThemeIcon('search');
         }
@@ -135,6 +138,20 @@ export class FindingsTreeProvider implements vscode.TreeDataProvider<FindingNode
             [],
         );
 
+        // Log node
+        const logNode = new FindingNode(
+            'log',
+            'Open Scan Log',
+            undefined,
+            [],
+        );
+        logNode.iconPath = new vscode.ThemeIcon('output');
+        logNode.contextValue = 'log';
+        logNode.command = {
+            command: 'opencode.openLogFile',
+            title: 'Open Scan Log',
+        };
+
         // Group by file_path -> function_name -> findings
         const fileMap = new Map<string, Map<string, Finding[]>>();
         for (const finding of visible) {
@@ -150,7 +167,7 @@ export class FindingsTreeProvider implements vscode.TreeDataProvider<FindingNode
             funcMap.get(func)!.push(finding);
         }
 
-        const rootNodes: FindingNode[] = [summaryNode];
+        const rootNodes: FindingNode[] = [summaryNode, logNode];
         for (const [filePath, funcMap] of fileMap.entries()) {
             const fileFindings = Array.from(funcMap.values()).flat();
             const fileCount = fileFindings.length;
