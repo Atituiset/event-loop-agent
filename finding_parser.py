@@ -124,15 +124,15 @@ def _extract_metadata(markdown: str) -> dict[str, str]:
 
 
 def _parse_severity(text: str, confidence: float = 0.5) -> str:
-    """Map Chinese severity keywords to normalized levels."""
+    """Map severity keywords to normalized levels."""
     lowered = text.lower()
     if "高危" in text or "critical" in lowered or "严重" in text:
         return "CRITICAL"
-    if "中危" in text or "high" in lowered:
+    if "中危" in text or "high" in lowered or "高" in text:
         return "HIGH"
-    if "低危" in text or "medium" in lowered:
+    if "低危" in text or "medium" in lowered or "中" in text:
         return "MEDIUM"
-    if "信息" in text or "low" in lowered:
+    if "信息" in text or "low" in lowered or "低" in text:
         return "LOW"
 
     # Fallback: infer from confidence if no explicit severity keyword
@@ -144,7 +144,7 @@ def _parse_severity(text: str, confidence: float = 0.5) -> str:
 
 
 def _parse_confidence(text: str) -> float:
-    """Parse confidence text like '高', '中', '低', '★★★★★', '0.85'."""
+    """Parse confidence text like '高', '中', '低', 'HIGH', '★★★★★', '0.85'."""
     if not text:
         return 0.5
 
@@ -160,31 +160,62 @@ def _parse_confidence(text: str) -> float:
     if stars:
         return stars / 5.0
 
-    # Keywords
-    if "高" in text or "确定" in text or "确定" in text:
+    # Keywords (Chinese and English)
+    if "高" in text or "确定" in text or "high" in text:
         return 0.9
-    if "中" in text:
+    if "中" in text or "medium" in text:
         return 0.6
-    if "低" in text:
+    if "低" in text or "low" in text:
         return 0.3
 
     return 0.5
 
 
-def _extract_rule_id(title: str) -> str:
-    """Extract first RULE-XXX from a title."""
+def _extract_rule_id(block: str, title: str = "") -> str:
+    """Extract RULE-XXX from an issue block or title."""
+    # Table format: | **规则** | RULE-003 — description |
+    match = re.search(r"\*\*规则\*\*[:：]?\s*\|\s*(RULE-\d{3})", block)
+    if match:
+        return match.group(1)
+    # Inline in title
     match = re.search(r"(RULE-\d{3})", title)
-    return match.group(1) if match else "RULE-000"
+    if match:
+        return match.group(1)
+    return _infer_rule_id(title + " " + block)
 
 
-def _extract_line_number(markdown: str) -> int:
-    """Extract the first line number reference like file.c:24 or line 24."""
+def _infer_rule_id(text: str) -> str:
+    """Infer rule ID from description keywords when nga omits explicit rule."""
+    lowered = text.lower()
+    if any(k in lowered for k in ["buffer overflow", "off-by-one", "memcpy", "memset", "边界", "越界", "数组"]):
+        return "RULE-002"
+    if any(k in lowered for k in ["malloc", "free", "leak", "fd leak", "resource leak", "内存泄漏"]):
+        return "RULE-006"
+    if any(k in lowered for k in ["return value", "unchecked", "未检查", "返回值"]):
+        return "RULE-001"
+    if any(k in lowered for k in ["null pointer", "pointer", "空指针"]):
+        return "RULE-002"
+    if any(k in lowered for k in ["switch", "default", "case"]):
+        return "RULE-003"
+    if any(k in lowered for k in ["tlv", "asn.1", "边界校验", "length"]):
+        return "RULE-001"
+    if any(k in lowered for k in ["format string", "printf", "sprintf"]):
+        return "RULE-004"
+    return "RULE-000"
+
+
+def _extract_line_number(block: str) -> int:
+    """Extract the first line number reference from an issue block."""
+    # Chinese format: 第19行 or 第19行、第30行 or 第23-24行
+    match = re.search(r"第(\d{1,})(?:行|、|,|\-|\s)", block)
+    if match:
+        return int(match.group(1))
     # file.c:24 or file.c:24,30
-    match = re.search(r":(\d{2,})(?:-\d+|,\d+)?", markdown)
+    match = re.search(r":(\d{1,})(?:-\d+|,\d+)?", block)
     if match:
         return int(match.group(1))
     # line 24 / line 42-45
-    match = re.search(r"line\s+(\d{2,})", markdown, re.IGNORECASE)
+    match = re.search(r"line\s+(\d{1,})", block, re.IGNORECASE)
     if match:
         return int(match.group(1))
     return 0
@@ -194,16 +225,20 @@ def _split_into_issue_blocks(markdown: str) -> list[str]:
     """
     Split report markdown into individual issue blocks.
 
-    Supports two observed formats:
+    Supports formats:
+    - '### [ISSUE-N] ...'
     - '### 问题 N — ...'
-    - '## 问题 N: ...'
+    - '### Bug: ...'
+    - '### Missing ...'
     """
-    # Normalize line endings
     text = markdown.replace("\r\n", "\n")
 
-    # Match issue headers: '### 问题 N' or '## 问题 N' followed by content until next same-level header or summary
+    # Match issue headers. Exclude summary sections.
     pattern = re.compile(
-        r"(?:^|\n)(#{2,3}\s*问题\s*\d+[\s:—\-]+.*?)(?=\n#{2,3}\s*(?:问题\s*\d+|总结|总结)|\n---\s*\n|\Z)",
+        r"(?:^|\n)(#{2,3}\s*(?:\[ISSUE-\d+\]|问题\s*\d+|Bug:|Missing\s|Dead\s+code:).*?)(?="
+        r"\n#{2,3}\s*(?:\[ISSUE-\d+\]|问题\s*\d+|Bug:|Missing\s|Dead\s+code:|逐规则总体结论|总结|总结)|"
+        r"\n---\s*\n|"
+        r"\Z)",
         re.DOTALL,
     )
     blocks = pattern.findall(text)
@@ -211,9 +246,9 @@ def _split_into_issue_blocks(markdown: str) -> list[str]:
     if blocks:
         return [b.strip() for b in blocks if b.strip()]
 
-    # Fallback: split by '---' separators if headers are not detected
+    # Fallback: split by '---' separators
     parts = re.split(r"\n---\s*\n", text)
-    return [p.strip() for p in parts if "问题" in p or "RULE-" in p]
+    return [p.strip() for p in parts if re.search(r"\[ISSUE-\d+\]|问题\s*\d+|Bug:|Missing\s|Dead\s+code:", p)]
 
 
 def _extract_first_code_block(block: str) -> str:
@@ -228,36 +263,75 @@ def _extract_first_code_block(block: str) -> str:
 
 def _extract_description(block: str) -> str:
     """Extract description from an issue block."""
-    # Format 1: '- **描述**: ...'
-    match = re.search(r"\*\*描述\*\*[:：]\s*(.*?)(?=\n\s*-\s*\*\*|\n\s*\*\*修复|\n\s*\*\*置信|\Z)", block, re.DOTALL)
+    # '**问题描述**：'
+    match = re.search(
+        r"\*\*问题描述\*\*[:：]\s*(.*?)(?=\n\s*\*\*(?:相关代码|修复建议|置信度|严重度)|\Z)",
+        block,
+        re.DOTALL,
+    )
     if match:
         return match.group(1).strip()
-    # Format 2: '**问题描述**: ...'
-    match = re.search(r"\*\*问题描述\*\*[:：]\s*(.*?)(?=\n\s*\*\*修复|\n\s*\*\*置信|\Z)", block, re.DOTALL)
+    # '- **描述**: ...'
+    match = re.search(
+        r"\*\*描述\*\*[:：]\s*(.*?)(?=\n\s*-\s*\*\*|\n\s*\*\*修复|\n\s*\*\*置信|\Z)",
+        block,
+        re.DOTALL,
+    )
     if match:
         return match.group(1).strip()
+    # Fallback: first paragraph after the header line
+    lines = block.split("\n")
+    if len(lines) > 1:
+        # Skip header line and empty lines, take next non-empty paragraph
+        paragraphs = "\n".join(lines[1:]).split("\n\n")
+        for p in paragraphs:
+            stripped = p.strip()
+            if stripped and not stripped.startswith("```"):
+                return stripped
     return ""
 
 
 def _extract_suggestion(block: str) -> str:
     """Extract fix suggestion from an issue block."""
-    # Format 1: '- **修复建议**: ...' up to next bold field or code block end
-    match = re.search(r"\*\*修复建议\*\*[:：]\s*(.*?)(?=\n\s*-\s*\*\*|\n\s*\*\*置信|\Z)", block, re.DOTALL)
+    # '**修复建议**：'
+    match = re.search(
+        r"\*\*修复建议\*\*[:：]\s*(.*?)(?=\n\s*\*\*置信度|\n\s*\*\*严重度|\Z)",
+        block,
+        re.DOTALL,
+    )
     if match:
         return match.group(1).strip()
-    # Format 2: '**修复建议**: ...'
-    match = re.search(r"\*\*修复建议\*\*[:：]\s*(.*?)(?=\n\s*\*\*置信|\Z)", block, re.DOTALL)
+    # '- **修复建议**: ...'
+    match = re.search(
+        r"\*\*修复建议\*\*[:：]\s*(.*?)(?=\n\s*-\s*\*\*|\n\s*\*\*置信|\Z)",
+        block,
+        re.DOTALL,
+    )
     if match:
         return match.group(1).strip()
     return ""
 
 
 def _extract_confidence(block: str) -> float:
-    """Extract confidence value from an issue block."""
+    """Extract confidence value from an issue block (table or bold field)."""
+    # Table format: | **置信度** | HIGH |
+    match = re.search(r"\*\*置信度\*\*[:：]?\s*\|\s*([^|\n]+)\|", block)
+    if match:
+        return _parse_confidence(match.group(1))
+    # Bold field format
     match = re.search(r"\*\*置信度\*\*[:：]\s*(.*?)(?:\n|\Z)", block)
     if match:
         return _parse_confidence(match.group(1))
     return 0.5
+
+
+def _extract_severity(block: str, confidence: float = 0.5) -> str:
+    """Extract severity value from an issue block (table or keywords)."""
+    # Table format: | **严重度** | 🔴 高 |
+    match = re.search(r"\*\*严重度\*\*[:：]?\s*\|\s*([^|\n]+)\|", block)
+    if match:
+        return _parse_severity(match.group(1), confidence)
+    return _parse_severity("", confidence)
 
 
 def parse_findings_from_markdown(
@@ -295,16 +369,21 @@ def parse_findings_from_markdown(
     blocks = _split_into_issue_blocks(markdown)
 
     for block in blocks:
-        title_match = re.search(r"问题\s*\d+[\s:—\-]+(.*)", block.split("\n")[0])
-        title = title_match.group(1).strip() if title_match else ""
+        first_line = block.split("\n")[0]
+        # Support '[ISSUE-N] title', '问题 N — title', 'Bug: title', 'Missing ...', 'Dead code: ...'
+        title_match = re.search(
+            r"(?:\[ISSUE-\d+\]|问题\s*\d+[\s:—\-]+|Bug:|Missing\s|Dead\s+code:)(.*)",
+            first_line,
+        )
+        title = title_match.group(1).strip() if title_match else first_line.lstrip("# ").strip()
 
-        rule_id = _extract_rule_id(title)
+        rule_id = _extract_rule_id(block, title)
         line_number = _extract_line_number(block)
         code_snippet = _extract_first_code_block(block)
         description = _extract_description(block)
         suggestion = _extract_suggestion(block)
         confidence = _extract_confidence(block)
-        severity = _parse_severity(description or title, confidence)
+        severity = _extract_severity(block, confidence)
 
         finding_id = generate_finding_id(
             repo_url=repo_url,

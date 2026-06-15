@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { FindingsTreeProvider } from './treeProvider';
 
 export class FindingsFileWatcher {
-    private watcher: vscode.FileSystemWatcher | undefined;
+    private watchers: vscode.FileSystemWatcher[] = [];
     private treeProvider: FindingsTreeProvider;
 
     constructor(treeProvider: FindingsTreeProvider) {
@@ -15,16 +15,23 @@ export class FindingsFileWatcher {
             return;
         }
 
-        // Watch for findings.json files in any reports/ subdirectory
-        this.watcher = vscode.workspace.createFileSystemWatcher('**/reports/**/*.findings.json');
+        // Watch for findings.json files in reports/ or agent_review_report/ subdirectories
+        const patterns = [
+            '**/reports/**/*.findings.json',
+            '**/agent_review_report/**/*.findings.json',
+        ];
+        this.watchers = patterns.map((pattern) =>
+            vscode.workspace.createFileSystemWatcher(pattern)
+        );
 
-        this.watcher.onDidCreate((uri) => {
-            this.onNewFindings(uri);
-        });
-
-        this.watcher.onDidChange((uri) => {
-            this.onNewFindings(uri);
-        });
+        for (const watcher of this.watchers) {
+            watcher.onDidCreate((uri) => {
+                this.onNewFindings(uri);
+            });
+            watcher.onDidChange((uri) => {
+                this.onNewFindings(uri);
+            });
+        }
 
         // Initial scan for existing findings
         this.scanExistingFindings();
@@ -32,7 +39,11 @@ export class FindingsFileWatcher {
 
     private async scanExistingFindings(): Promise<void> {
         try {
-            const files = await vscode.workspace.findFiles('**/reports/**/*.findings.json', null, 10);
+            const files = await vscode.workspace.findFiles(
+                '{reports,agent_review_report}/**/*.findings.json',
+                null,
+                10,
+            );
             if (files.length > 0) {
                 await this.treeProvider.loadFindings();
             }
@@ -63,6 +74,9 @@ export class FindingsFileWatcher {
     }
 
     dispose(): void {
-        this.watcher?.dispose();
+        for (const watcher of this.watchers) {
+            watcher.dispose();
+        }
+        this.watchers = [];
     }
 }
