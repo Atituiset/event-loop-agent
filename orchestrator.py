@@ -1124,7 +1124,7 @@ class OpenCodeOrchestrator:
                 task.start_time = time.time()
                 tracker.start_task()
 
-                logger.info(f"[{task.task_id}] START {task.file_path}")
+                logger.info(f"[{task.task_id}] START {task.file_path}:1")
 
                 # debug 模式下分配槽位并通知 web server
                 slot_id: Optional[int] = None
