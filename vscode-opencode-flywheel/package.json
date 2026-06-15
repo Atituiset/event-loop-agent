@@ -20,7 +20,7 @@
       "activitybar": [
         {
           "id": "opencodeFlywheel",
-          "title": "OpenCode",
+          "title": "AI Reviewer",
           "icon": "resources/icon.svg"
         }
       ]
