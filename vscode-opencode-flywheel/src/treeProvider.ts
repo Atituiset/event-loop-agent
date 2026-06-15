@@ -31,9 +31,23 @@ export class FindingNode extends vscode.TreeItem {
             this.iconPath = vscode.ThemeIcon.File;
             this.contextValue = 'file';
             this.tooltip = finding?.file_path || label;
+            if (finding?.log_file) {
+                this.command = {
+                    command: 'opencode.openFileLog',
+                    title: 'Open File Log',
+                    arguments: [finding.log_file],
+                };
+            }
         } else if (type === 'function') {
             this.iconPath = new vscode.ThemeIcon('symbol-method');
             this.contextValue = 'function';
+            if (finding?.log_file) {
+                this.command = {
+                    command: 'opencode.openFileLog',
+                    title: 'Open Function Log',
+                    arguments: [finding.log_file],
+                };
+            }
         } else if (type === 'summary') {
             this.iconPath = new vscode.ThemeIcon('dashboard');
             this.contextValue = 'summary';

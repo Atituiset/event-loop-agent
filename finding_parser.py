@@ -32,6 +32,7 @@ class Finding:
     scan_timestamp: str = ""
     mr_link: str = ""
     task_id: str = ""
+    log_file: str = ""
 
     # Feedback fields (populated later)
     label: Optional[str] = None  # "true_positive" | "false_positive"

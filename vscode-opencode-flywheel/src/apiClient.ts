@@ -14,6 +14,7 @@ export interface Finding {
     scan_timestamp?: string;
     label?: 'true_positive' | 'false_positive' | null;
     label_reason?: string;
+    log_file?: string;
 }
 
 export interface FeedbackStats {
