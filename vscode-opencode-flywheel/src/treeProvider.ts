@@ -1,7 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { ApiClient, FeedbackStats, Finding } from './apiClient';
-import { SummaryPanel } from './summaryPanel';
 
 export type FindingNodeType = 'root' | 'summary' | 'log' | 'file' | 'function' | 'finding';
 
@@ -65,7 +64,7 @@ export class FindingNode extends vscode.TreeItem {
 
     private getSeverityIcon(
         severity: string,
-        label?: string | null,
+        _label?: string | null,
     ): vscode.ThemeIcon {
         switch (severity.toUpperCase()) {
             case 'CRITICAL':

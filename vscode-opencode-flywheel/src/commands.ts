@@ -4,6 +4,7 @@ import { ApiClient } from './apiClient';
 import { FindingPanel } from './findingPanel';
 import { SessionManager } from './sessionManager';
 import { SummaryPanel } from './summaryPanel';
+import { readSessionInfo } from './sessionInfo';
 import { FindingNode, FindingsTreeProvider } from './treeProvider';
 
 export function registerCommands(
@@ -27,7 +28,8 @@ export function registerCommands(
         }),
 
         vscode.commands.registerCommand('opencode.openSummary', () => {
-            SummaryPanel.show(treeProvider.getFindings(), treeProvider.getStats());
+            const sessionInfo = readSessionInfo(treeProvider.getDbPath());
+            SummaryPanel.show(treeProvider.getFindings(), treeProvider.getStats(), sessionInfo);
         }),
 
         vscode.commands.registerCommand('opencode.openLogFile', async () => {

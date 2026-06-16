@@ -1,0 +1,35 @@
+.vscode/**
+.vscode-test/**
+src/**
+out/test/**
+out/**/*.test.js
+out/**/*.test.js.map
+.gitignore
+.yarnrc
+vsc-extension-quickstart.md
+**/*.map
+**/*.ts
+**/tsconfig.json
+**/.eslintrc.json
+
+# Prune node_modules heavily, but keep sql.js runtime files
+node_modules/**
+!node_modules/sql.js/package.json
+!node_modules/sql.js/dist/sql-wasm.js
+!node_modules/sql.js/dist/sql-wasm.wasm
+
+# Exclude common heavy/unnecessary files inside kept packages
+node_modules/**/*.d.ts
+node_modules/**/*.map
+node_modules/**/test/**
+node_modules/**/tests/**
+node_modules/**/docs/**
+node_modules/**/examples/**
+node_modules/**/.github/**
+node_modules/**/CONTRIBUTING.md
+node_modules/**/CHANGELOG.md
+node_modules/**/.editorconfig
+node_modules/**/.gitignore
+node_modules/**/.npmignore
+node_modules/**/.travis.yml
+node_modules/**/.eslintrc
