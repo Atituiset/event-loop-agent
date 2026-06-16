@@ -1,6 +1,6 @@
 .worktrees/
 __pycache__/
 *.pyc
-benchmark_cache.py
+/benchmark_cache.py
 reports/
 agent_review_report/

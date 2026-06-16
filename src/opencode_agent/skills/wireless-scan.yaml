@@ -12,6 +12,12 @@ agent:
     - NAS层协议
     - C/C++安全编码
     - ASN.1编码规范
+    - 高低版本消息兼容性与适配性问题分析
+    - TLV (Type-Length-Value) 解析与向前兼容性设计
+    - 结构体强转与内存越界风险识别
+    - Switch-Case 消息分发防御性编程
+    - ASN.1 Optional 字段与空指针解引用防护
+    - 无线通信协议版本迭代中的代码雷区排查
 
 workflow:
   - 通过 MCP 工具获取 MR 涉及的所有 C/C++ 源码文件
