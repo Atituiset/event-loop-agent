@@ -16,6 +16,29 @@ from opencode_agent.utils.logging import get_logger
 logger = get_logger("CLI")
 
 
+def _resolve_workspace(paths: list[str], fallback: str) -> Path:
+    """Resolve the workspace directory from scan paths.
+
+    If all provided paths are absolute and share a common parent, use the
+    deepest common parent. Otherwise fall back to the provided fallback.
+    """
+    if not paths:
+        return Path(fallback)
+
+    resolved = [Path(p).resolve() for p in paths]
+    if not all(p.is_absolute() for p in resolved):
+        return Path(fallback)
+
+    common = resolved[0].parent
+    for p in resolved[1:]:
+        # Walk up until common is a parent of p
+        while not (p == common or common in p.parents):
+            common = common.parent
+            if common == common.parent:
+                return Path(fallback)
+    return common
+
+
 def build_combined_prompt(registry: SkillRegistry, config: ConfigLoader) -> str:
     """Build combined prompt from enabled skills and rules."""
     available_skills = list(registry.skills.keys())
@@ -135,7 +158,7 @@ def main() -> int:
     parser.add_argument(
         "--workspace",
         default="",
-        help="nga 工作目录，传给 --dir 参数（默认使用被扫描文件所在目录）",
+        help="输出报告和 nga 工作目录（默认自动推断为被扫描项目的根目录）",
     )
     parser.add_argument(
         "--output-json",
@@ -145,8 +168,26 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    # Determine workspace / project_dir
+    if args.workspace:
+        workspace = args.workspace
+        project_dir = Path(workspace)
+    elif args.diff:
+        workspace = args.repo
+        project_dir = Path(args.repo) if args.repo else Path.cwd()
+    elif args.full:
+        workspace = str(_resolve_workspace(args.full, str(Path.cwd())))
+        project_dir = Path(workspace)
+    elif args.files:
+        workspace = str(_resolve_workspace(args.files, str(Path.cwd())))
+        project_dir = Path(workspace)
+    else:
+        workspace = ""
+        project_dir = Path.cwd()
+
+    logger.info(f"Workspace: {workspace}")
+
     # Setup config and skills
-    project_dir = Path(args.repo) if args.repo else Path.cwd()
     config_loader = ConfigLoader(project_dir=project_dir)
     skill_registry = SkillRegistry(project_dir=project_dir)
 
@@ -184,7 +225,7 @@ def main() -> int:
         session_timeout=args.timeout,
         debug=args.debug,
         web_port=args.web_port,
-        workspace=args.workspace,
+        workspace=workspace,
         output_json=args.output_json,
     )
 
