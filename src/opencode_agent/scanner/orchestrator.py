@@ -33,19 +33,19 @@ nga 交互方式:
 
 输出:
   - 终端: START/DONE/进度摘要（每个 task 带文件路径前缀，方便追踪）
-  - reports/YYYYMMDD_HHMMSS/<relative_path>/<file>.md: Markdown 审查报告
-  - reports/YYYYMMDD_HHMMSS/<relative_path>/<file>.log: 运行日志（含 nga stdout/stderr）
-  - reports/YYYYMMDD_HHMMSS/diffs/<relative_path>/<file>.diff: diff 内容（Diff 模式）
-  - reports/YYYYMMDD_HHMMSS/summary.md: 汇总报告
-  - reports/YYYYMMDD_HHMMSS/orchestrator.log: 全局执行日志
+  - agent_review_report/YYYYMMDD_HHMMSS/<relative_path>/<file>.md: Markdown 审查报告
+  - agent_review_report/YYYYMMDD_HHMMSS/<relative_path>/<file>.log: 运行日志（含 nga stdout/stderr）
+  - agent_review_report/YYYYMMDD_HHMMSS/diffs/<relative_path>/<file>.diff: diff 内容（Diff 模式）
+  - agent_review_report/YYYYMMDD_HHMMSS/summary.md: 汇总报告
+  - agent_review_report/YYYYMMDD_HHMMSS/orchestrator.log: 全局执行日志
 
 输出路径规则:
   - 报告和日志按文件的完整相对路径存放，保留 cared_path 前缀
   - diff 文件单独存放在 diffs/ 子目录下，同样保留目录结构
   - 示例: cared_path=src/rr, 文件=src/rr/abc/cde/efg/Hello.c
-    -> reports/20250429/src/rr/abc/cde/efg/Hello.md
-    -> reports/20250429/src/rr/abc/cde/efg/Hello.log
-    -> reports/20250429/diffs/src/rr/abc/cde/efg/Hello.diff
+    -> agent_review_report/20250429/src/rr/abc/cde/efg/Hello.md
+    -> agent_review_report/20250429/src/rr/abc/cde/efg/Hello.log
+    -> agent_review_report/20250429/diffs/src/rr/abc/cde/efg/Hello.diff
 """
 
 from __future__ import annotations
@@ -142,7 +142,7 @@ class OpenCodeOrchestrator:
         if self.workspace:
             self.output_dir = Path(self.workspace) / "agent_review_report" / datetime.now().strftime("%Y%m%d_%H%M%S")
         else:
-            self.output_dir = Path("reports") / datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.output_dir = Path("agent_review_report") / datetime.now().strftime("%Y%m%d_%H%M%S")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Output directory: {self.output_dir}")
 
