@@ -1,4 +1,8 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
+import * as fs from 'fs';
+import initSqlJs from 'sql.js';
+import type { Database, SqlJsStatic } from 'sql.js';
 
 export interface Finding {
     finding_id: string;
@@ -15,6 +19,8 @@ export interface Finding {
     label?: 'true_positive' | 'false_positive' | null;
     label_reason?: string;
     log_file?: string;
+    labeled_by?: string;
+    labeled_at?: string;
 }
 
 export interface FeedbackStats {
@@ -25,15 +31,11 @@ export interface FeedbackStats {
 }
 
 export class ApiClient {
-    private baseUrl: string;
-    private apiKey: string;
     private dbPath: string | undefined;
+    private sqlPromise: Promise<SqlJsStatic> | null = null;
 
     constructor() {
-        const config = vscode.workspace.getConfiguration('opencode');
-        this.baseUrl = config.get<string>('apiBaseUrl') || 'http://localhost:8080';
-        this.apiKey = config.get<string>('apiKey') || '';
-        this.dbPath = config.get<string>('activeDbPath') || undefined;
+        this.dbPath = vscode.workspace.getConfiguration('opencode').get<string>('activeDbPath') || undefined;
     }
 
     setDbPath(dbPath: string | undefined): void {
@@ -45,43 +47,115 @@ export class ApiClient {
         return this.dbPath;
     }
 
-    private buildPath(path: string): string {
-        const params = new URLSearchParams();
-        if (this.dbPath) {
-            params.set('db_path', this.dbPath);
+    private getSql(): Promise<SqlJsStatic> {
+        if (!this.sqlPromise) {
+            const wasmPath = path.join(__dirname, '..', 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm');
+            this.sqlPromise = initSqlJs({
+                locateFile: () => wasmPath,
+            });
         }
-        const query = params.toString();
-        return query ? `${path}?${query}` : path;
+        return this.sqlPromise;
     }
 
-    private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
-        const headers: Record<string, string> = {
-            'Content-Type': 'application/json',
-            ...((options.headers as Record<string, string>) || {}),
-        };
-        if (this.apiKey) {
-            headers['X-API-Key'] = this.apiKey;
+    private ensureDbPath(): string {
+        if (!this.dbPath) {
+            throw new Error('No database open. Select an OpenCode scan session first.');
+        }
+        return this.dbPath;
+    }
+
+    private async openDatabase(): Promise<Database> {
+        const SQL = await this.getSql();
+        const dbPath = this.ensureDbPath();
+
+        if (!fs.existsSync(dbPath)) {
+            throw new Error(`Database not found: ${dbPath}`);
         }
 
-        const url = `${this.baseUrl}${this.buildPath(path)}`;
-        const response = await fetch(url, { ...options, headers });
-        if (!response.ok) {
-            const text = await response.text();
-            throw new Error(`API error ${response.status}: ${text}`);
-        }
-        return response.json() as Promise<T>;
+        const buffer = fs.readFileSync(dbPath);
+        return new SQL.Database(buffer);
+    }
+
+    private rowToFinding(row: Record<string, unknown>): Finding {
+        const rawLabel = row.label as string | null;
+        const label: Finding['label'] =
+            rawLabel === 'true_positive' || rawLabel === 'false_positive'
+                ? rawLabel
+                : null;
+
+        return {
+            finding_id: row.finding_id as string,
+            file_path: row.file_path as string,
+            line_number: row.line_number as number,
+            rule_id: row.rule_id as string,
+            severity: row.severity as string,
+            description: row.description as string,
+            code_snippet: row.code_snippet as string,
+            suggestion: row.suggestion as string,
+            confidence: row.confidence as number,
+            function_name: (row.function_name as string) || undefined,
+            scan_timestamp: (row.scan_timestamp as string) || undefined,
+            label,
+            label_reason: (row.label_reason as string) || undefined,
+            log_file: (row.log_file as string) || undefined,
+            labeled_by: (row.labeled_by as string) || undefined,
+            labeled_at: (row.labeled_at as string) || undefined,
+        };
     }
 
     async getFindings(filePath?: string, functionName?: string): Promise<Finding[]> {
-        const params = new URLSearchParams();
-        if (filePath) { params.set('file_path', filePath); }
-        if (functionName) { params.set('function_name', functionName); }
-        const query = params.toString() ? `?${params.toString()}` : '';
-        return this.request<Finding[]>(`/api/findings${query}`);
+        const db = await this.openDatabase();
+        try {
+            const conditions: string[] = [];
+            const params: (string | number)[] = [];
+
+            if (filePath) {
+                conditions.push('file_path = ?');
+                params.push(filePath);
+            }
+            if (functionName) {
+                conditions.push('function_name = ?');
+                params.push(functionName);
+            }
+
+            const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+            const result = db.exec(`SELECT * FROM findings ${whereClause}`, params);
+
+            if (result.length === 0 || result[0].values.length === 0) {
+                return [];
+            }
+
+            const columns = result[0].columns;
+            return result[0].values.map((row) => {
+                const record: Record<string, unknown> = {};
+                columns.forEach((col, idx) => {
+                    record[col] = row[idx];
+                });
+                return this.rowToFinding(record);
+            });
+        } finally {
+            db.close();
+        }
     }
 
     async getFinding(findingId: string): Promise<Finding> {
-        return this.request<Finding>(`/api/findings/${encodeURIComponent(findingId)}`);
+        const db = await this.openDatabase();
+        try {
+            const result = db.exec('SELECT * FROM findings WHERE finding_id = ?', [findingId]);
+            if (result.length === 0 || result[0].values.length === 0) {
+                throw new Error(`Finding not found: ${findingId}`);
+            }
+
+            const columns = result[0].columns;
+            const row = result[0].values[0];
+            const record: Record<string, unknown> = {};
+            columns.forEach((col, idx) => {
+                record[col] = row[idx];
+            });
+            return this.rowToFinding(record);
+        } finally {
+            db.close();
+        }
     }
 
     async labelFinding(
@@ -89,24 +163,56 @@ export class ApiClient {
         label: 'true_positive' | 'false_positive',
         reason?: string,
     ): Promise<void> {
-        const user = await this.getUserIdentifier();
-        await this.request(`/api/findings/${encodeURIComponent(findingId)}/label`, {
-            method: 'POST',
-            body: JSON.stringify({ label, reason: reason || '', labeled_by: user }),
-        });
+        const db = await this.openDatabase();
+        try {
+            const user = this.getUserIdentifierSync();
+            db.run(
+                'UPDATE findings SET label = ?, labeled_by = ?, labeled_at = ?, label_reason = ? WHERE finding_id = ?',
+                [label, user, new Date().toISOString(), reason || '', findingId],
+            );
+
+            if (db.getRowsModified() === 0) {
+                throw new Error(`Finding not found: ${findingId}`);
+            }
+
+            const data = db.export();
+            fs.writeFileSync(this.ensureDbPath(), Buffer.from(data));
+        } finally {
+            db.close();
+        }
     }
 
     async getStats(): Promise<FeedbackStats> {
-        return this.request<FeedbackStats>('/api/stats');
+        const db = await this.openDatabase();
+        try {
+            const total = this.execCount(db, 'SELECT COUNT(*) FROM findings');
+            const truePositives = this.execCount(db, "SELECT COUNT(*) FROM findings WHERE label = 'true_positive'");
+            const falsePositives = this.execCount(db, "SELECT COUNT(*) FROM findings WHERE label = 'false_positive'");
+            const unlabeled = this.execCount(db, 'SELECT COUNT(*) FROM findings WHERE label IS NULL');
+
+            return {
+                total_findings: total,
+                true_positives: truePositives,
+                false_positives: falsePositives,
+                unlabeled: unlabeled,
+            };
+        } finally {
+            db.close();
+        }
     }
 
-    private async getUserIdentifier(): Promise<string> {
+    private execCount(db: Database, sql: string): number {
+        const result = db.exec(sql);
+        if (result.length === 0 || result[0].values.length === 0) {
+            return 0;
+        }
+        return result[0].values[0][0] as number;
+    }
+
+    private getUserIdentifierSync(): string {
         try {
-            const { exec } = await import('child_process');
-            const { promisify } = await import('util');
-            const execAsync = promisify(exec);
-            const { stdout } = await execAsync('git config user.email', { timeout: 2000 });
-            return stdout.trim();
+            const { execSync } = require('child_process');
+            return execSync('git config user.email', { encoding: 'utf-8', timeout: 2000 }).trim();
         } catch {
             return 'unknown';
         }

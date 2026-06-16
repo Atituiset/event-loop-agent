@@ -15,10 +15,12 @@ export class FindingsFileWatcher {
             return;
         }
 
-        // Watch for findings.json files in reports/ or agent_review_report/ subdirectories
+        // Watch for findings.json and findings.db files in reports/ or agent_review_report/ subdirectories
         const patterns = [
             '**/reports/**/*.findings.json',
             '**/agent_review_report/**/*.findings.json',
+            '**/reports/**/findings.db',
+            '**/agent_review_report/**/findings.db',
         ];
         this.watchers = patterns.map((pattern) =>
             vscode.workspace.createFileSystemWatcher(pattern)
@@ -40,7 +42,7 @@ export class FindingsFileWatcher {
     private async scanExistingFindings(): Promise<void> {
         try {
             const files = await vscode.workspace.findFiles(
-                '{reports,agent_review_report}/**/*.findings.json',
+                '{reports,agent_review_report}/**/*.{findings.json,findings.db}',
                 null,
                 10,
             );
@@ -52,7 +54,7 @@ export class FindingsFileWatcher {
         }
     }
 
-    private async onNewFindings(uri: vscode.Uri): Promise<void> {
+    private async onNewFindings(_uri: vscode.Uri): Promise<void> {
         const config = vscode.workspace.getConfiguration('opencode');
         if (!config.get<boolean>('autoLoadFindings')) { return; }
 
