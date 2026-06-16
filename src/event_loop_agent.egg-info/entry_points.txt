@@ -1,2 +1,0 @@
-[console_scripts]
-opencode-agent = opencode_agent.cli.main:main
