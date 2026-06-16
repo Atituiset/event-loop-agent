@@ -17,14 +17,15 @@ from opencode_agent.findings.parser import Finding
 class FindingStore:
     """SQLite store for findings and user feedback."""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, timeout: float = 30.0):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.timeout = timeout
         self._init_db()
 
     def _init_db(self):
         """Create tables and indexes if they do not exist."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.timeout) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS findings (
@@ -83,7 +84,7 @@ class FindingStore:
         if not findings:
             return
 
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.timeout) as conn:
             conn.row_factory = sqlite3.Row
             for finding in findings:
                 data = finding.to_dict()
@@ -111,7 +112,7 @@ class FindingStore:
 
     def get_finding(self, finding_id: str) -> Optional[Finding]:
         """Retrieve a single finding by ID."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.timeout) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "SELECT * FROM findings WHERE finding_id = ?", (finding_id,)
@@ -120,7 +121,7 @@ class FindingStore:
 
     def get_all_findings(self) -> list[Finding]:
         """Get all findings in the store."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.timeout) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("SELECT * FROM findings").fetchall()
             return [self._row_to_finding(r) for r in rows]
@@ -131,7 +132,7 @@ class FindingStore:
         function_name: Optional[str] = None,
     ) -> list[Finding]:
         """Get all findings for a specific file, optionally filtered by function."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.timeout) as conn:
             conn.row_factory = sqlite3.Row
             if function_name:
                 rows = conn.execute(
@@ -174,7 +175,7 @@ class FindingStore:
         if labeled_at is None:
             labeled_at = datetime.now(timezone.utc).isoformat()
 
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.timeout) as conn:
             conn.execute(
                 """
                 UPDATE findings
@@ -186,7 +187,7 @@ class FindingStore:
 
     def get_feedback_stats(self) -> dict[str, Any]:
         """Return feedback statistics for dashboard."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.timeout) as conn:
             total = conn.execute(
                 "SELECT COUNT(*) FROM findings"
             ).fetchone()[0]
@@ -217,7 +218,7 @@ class FindingStore:
         total_findings: int = 0,
     ):
         """Record a scan session."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=self.timeout) as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO scan_sessions

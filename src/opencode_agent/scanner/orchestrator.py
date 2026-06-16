@@ -149,6 +149,7 @@ class OpenCodeOrchestrator:
         # 结构化 finding 输出与存储（数据飞轮）
         self.repo_url: str = ""
         self.finding_store: Optional[FindingStore] = None
+        self._findings_store_lock = asyncio.Lock()
         if self.output_json:
             try:
                 db_path = self.output_dir / "findings.db"
@@ -1098,7 +1099,8 @@ class OpenCodeOrchestrator:
                                 logger.debug(f"[{task.task_id}] Findings JSON saved: {findings_json_path}")
 
                                 if self.finding_store:
-                                    self.finding_store.save_findings(findings)
+                                    async with self._findings_store_lock:
+                                        self.finding_store.save_findings(findings)
                         except Exception as e:
                             logger.warning(f"[{task.task_id}] Failed to parse findings: {e}")
 
