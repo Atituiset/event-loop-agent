@@ -2,6 +2,8 @@
 .worktrees/
 __pycache__/
 *.pyc
+*.egg-info/
+uv.lock
 /benchmark_cache.py
 reports/
 agent_review_report/
