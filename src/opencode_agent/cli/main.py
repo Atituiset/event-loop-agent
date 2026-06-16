@@ -65,8 +65,8 @@ def main() -> int:
         """,
     )
 
-    # 输入模式（互斥）
-    group = parser.add_mutually_exclusive_group(required=True)
+    # 输入模式（互斥），但 list 类命令不需要
+    group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument(
         "--files",
         nargs="+",
@@ -83,6 +83,16 @@ def main() -> int:
         nargs="+",
         default=[],
         help="Full 扫描模式：按函数切分，每个函数一个 nga session",
+    )
+    parser.add_argument(
+        "--list-skills",
+        action="store_true",
+        help="列出所有 skill 和 rule",
+    )
+    parser.add_argument(
+        "--list-active",
+        action="store_true",
+        help="列出当前启用的 skill 和 rule",
     )
 
     parser.add_argument(
@@ -139,6 +149,29 @@ def main() -> int:
     project_dir = Path(args.repo) if args.repo else Path.cwd()
     config_loader = ConfigLoader(project_dir=project_dir)
     skill_registry = SkillRegistry(project_dir=project_dir)
+
+    if args.list_skills:
+        for skill_id in sorted(skill_registry.skills.keys()):
+            skill = skill_registry.skills[skill_id]
+            print(f"{skill_id}: {skill.name}")
+            for rule in skill.rules:
+                print(f"  {rule.global_id}: {rule.name}")
+        return 0
+
+    if args.list_active:
+        available_skills = list(skill_registry.skills.keys())
+        enabled_skills = config_loader.list_enabled_skills(available_skills)
+        for skill_id in enabled_skills:
+            skill = skill_registry.skills[skill_id]
+            print(f"{skill_id}: {skill.name}")
+            all_rules = [r.local_id for r in skill.rules]
+            enabled_rules = config_loader.get_enabled_rules(skill_id, all_rules)
+            for rid in enabled_rules:
+                print(f"  {skill_id}:{rid}")
+        return 0
+
+    if not args.files and not args.diff and not args.full:
+        parser.error("one of the arguments --files --diff --full is required")
 
     combined_prompt = build_combined_prompt(skill_registry, config_loader)
     if combined_prompt:
